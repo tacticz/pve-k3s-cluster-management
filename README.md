@@ -40,11 +40,12 @@ To check the installation:
 
 ## Installation
 
-1. Clone the repository or download the scripts:
-
+1. Clone the repository or download the scripts to each Proxmox host running one of the k3s clsuter VMs:
 ```bash
-git clone https://your-repo/k3s-cluster-management.git
-cd k3s-cluster-management
+> mkdir ~/bin
+> cd ~/bin
+> git clone https://github.com/tacticz/pve-k3s-cluster-management.git
+> cd pve-k3s-cluster-management
 ```
 
 2. Make the scripts executable:
