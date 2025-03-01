@@ -201,7 +201,7 @@ proxmox:
 # Backup settings
 backup:
   prefix: k3s-backup
-  location: /mnt/pvecephfs-1-backup
+  location: /mnt/pve/pvecephfs-1-backup
   compress: true
   include_etcd: true
 

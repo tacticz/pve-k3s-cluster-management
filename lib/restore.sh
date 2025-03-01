@@ -514,13 +514,13 @@ function restore_cluster() {
       else
         # Restore VM from backup
         if [[ "$DRY_RUN" != "true" ]]; then
-          restore_vm_from_backup "$node" "$backup_file" || {
+          if ! restore_vm_from_backup "$node" "$backup_file"; then
             if [[ "$FORCE" != "true" ]]; then
               log_error "Failed to restore VM for node $node. Aborting."
               continue
-            }
+            fi
             log_warn "Continuing despite VM restoration failure due to --force flag"
-          }
+          fi
         else
           log_info "[DRY RUN] Would restore VM $vm_id from backup $backup_file"
         fi
@@ -545,13 +545,13 @@ function restore_cluster() {
       else
         # Restore VM from snapshot
         if [[ "$DRY_RUN" != "true" ]]; then
-          restore_vm_from_snapshot "$node" "$snapshot_name" || {
+          if ! restore_vm_from_snapshot "$node" "$snapshot_name"; then
             if [[ "$FORCE" != "true" ]]; then
               log_error "Failed to restore VM for node $node. Aborting."
               continue
-            }
+            fi
             log_warn "Continuing despite VM restoration failure due to --force flag"
-          }
+          fi
         else
           log_info "[DRY RUN] Would restore VM $vm_id to snapshot $snapshot_name"
         fi
