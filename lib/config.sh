@@ -116,6 +116,74 @@ function setup_ssh_key() {
   fi
 }
 
+# Discover cluster nodes VM details using pvesh
+function discover_node_proxmox_details() {
+  log_info "Retrieving Proxmox VM details using pvesh..."
+  
+  # Check if pvesh is available
+  if ! command -v pvesh &>/dev/null; then
+    log_warn "pvesh command not available - cannot automatically discover VM details"
+    return 1
+  fi
+  
+  # Get resources from Proxmox API in JSON format
+  local vm_resources=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null)
+  
+  if [[ -z "$vm_resources" ]]; then
+    log_warn "Failed to get VM resources from Proxmox API"
+    return 1
+  fi
+  
+  log_info "Retrieved VM details from Proxmox, parsing..."
+  
+  # Process each node to find its VM details
+  for node in "${NODES[@]}"; do
+    # Extract VM details using grep and sed
+    # Look for the node name in the JSON output
+    local node_data=$(echo "$vm_resources" | grep -o '{[^}]*"name":"'"$node"'"[^}]*}')
+    
+    if [[ -n "$node_data" ]]; then
+      # Extract VMID and Proxmox host from the JSON data
+      local vm_id=$(echo "$node_data" | grep -o '"vmid":[0-9]*' | cut -d':' -f2)
+      local proxmox_host=$(echo "$node_data" | grep -o '"node":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+      
+      if [[ -n "$vm_id" && -n "$proxmox_host" ]]; then
+        log_info "Found VM ID $vm_id on host $proxmox_host for node $node"
+        
+        # Get current node details
+        local details="${NODE_DETAILS[$node]}"
+        # Update VM ID and Proxmox host
+        if [[ -n "$details" ]]; then
+          # Parse existing details
+          local ip=""
+          local role="worker"
+          
+          IFS=',' read -ra detail_parts <<< "$details"
+          for part in "${detail_parts[@]}"; do
+            key="${part%%=*}"
+            value="${part#*=}"
+            
+            case "$key" in
+              ip) ip="$value" ;;
+              role) role="$value" ;;
+            esac
+          done
+          
+          # Update details with new VM ID and host
+          NODE_DETAILS["$node"]="ip=$ip,role=$role,proxmox_vmid=$vm_id,proxmox_host=$proxmox_host"
+        else
+          NODE_DETAILS["$node"]="proxmox_vmid=$vm_id,proxmox_host=$proxmox_host"
+        fi
+      fi
+    else
+      log_warn "Could not find VM details for node $node in Proxmox resources"
+    fi
+  done
+  
+  log_success "VM details discovery completed"
+  return 0
+}
+
 # Discover cluster nodes
 function discover_cluster_nodes() {
   local control_node="$1"
@@ -164,32 +232,95 @@ function discover_cluster_nodes() {
       fi
     fi
     
-    # Try to get Proxmox VM ID and host
+    # Store basic node details - VM ID and host will be added later
+    NODE_DETAILS["$node"]="ip=$node_ip,role=$role,proxmox_vmid=,proxmox_host="
+  done
+  
+  # Attempt to discover VM details directly from Proxmox API
+  log_info "Attempting to discover VM details from Proxmox..."
+  discover_node_proxmox_details
+  
+  # If discovery wasn't successful or we're missing some details, try manually
+  for node in "${NODES[@]}"; do
+    local details="${NODE_DETAILS[$node]}"
+    
+    # Parse details to check if VM ID and host are set
     local vm_id=""
     local proxmox_host=""
     
-    # Try to get VM ID from Proxmox hosts
-    for host in "${PROXMOX_HOSTS[@]}"; do
-      if verify_ssh_access "$host"; then
-        vm_id=$(ssh -p "$SSH_PORT" root@$host "qm list | grep $node | awk '{print \$1}'" 2>/dev/null)
-        if [[ -n "$vm_id" ]]; then
-          proxmox_host="$host"
-          break
-        fi
-      fi
+    IFS=',' read -ra detail_parts <<< "$details"
+    for part in "${detail_parts[@]}"; do
+      key="${part%%=*}"
+      value="${part#*=}"
+      
+      case "$key" in
+        proxmox_vmid) vm_id="$value" ;;
+        proxmox_host) proxmox_host="$value" ;;
+      esac
     done
     
-    # Store node details
-    NODE_DETAILS["$node"]="ip=$node_ip,role=$role,proxmox_vmid=$vm_id,proxmox_host=$proxmox_host"
+    # If VM ID or host is missing, ask user
+    if [[ -z "$vm_id" || -z "$proxmox_host" ]]; then
+      log_warn "Missing Proxmox details for node $node"
+      
+      # Ask for VM ID if missing
+      if [[ -z "$vm_id" ]]; then
+        read -p "Enter VM ID for node $node (leave empty to skip): " vm_id
+      fi
+      
+      # Ask for Proxmox host if missing
+      if [[ -n "$vm_id" && -z "$proxmox_host" ]]; then
+        if [[ ${#PROXMOX_HOSTS[@]} -eq 1 ]]; then
+          # If only one Proxmox host, use it by default
+          proxmox_host="${PROXMOX_HOSTS[0]}"
+          log_info "Using only available Proxmox host: $proxmox_host"
+        else
+          # List available hosts for selection
+          if [[ ${#PROXMOX_HOSTS[@]} -gt 0 ]]; then
+            echo "Available Proxmox hosts:"
+            for i in "${!PROXMOX_HOSTS[@]}"; do
+              echo "$((i+1)). ${PROXMOX_HOSTS[$i]}"
+            done
+            read -p "Enter Proxmox host number for VM $vm_id: " host_idx
+            
+            if [[ "$host_idx" =~ ^[0-9]+$ && "$host_idx" -ge 1 && "$host_idx" -le "${#PROXMOX_HOSTS[@]}" ]]; then
+              proxmox_host="${PROXMOX_HOSTS[$((host_idx-1))]}"
+            else
+              read -p "Enter Proxmox host for VM $vm_id: " proxmox_host
+            fi
+          else
+            read -p "Enter Proxmox host for VM $vm_id: " proxmox_host
+          fi
+        fi
+      fi
+      
+      # Update node details with user-provided information
+      if [[ -n "$vm_id" || -n "$proxmox_host" ]]; then
+        local ip=""
+        local role="worker"
+        
+        IFS=',' read -ra detail_parts <<< "$details"
+        for part in "${detail_parts[@]}"; do
+          key="${part%%=*}"
+          value="${part#*=}"
+          
+          case "$key" in
+            ip) ip="$value" ;;
+            role) role="$value" ;;
+          esac
+        done
+        
+        NODE_DETAILS["$node"]="ip=$ip,role=$role,proxmox_vmid=$vm_id,proxmox_host=$proxmox_host"
+        log_info "Updated details for node $node: VM ID=$vm_id, Proxmox Host=$proxmox_host"
+      fi
+    fi
   done
   
   return 0
 }
 
 # Discover Proxmox hosts
-function discover_proxmox_hosts() {
-  local node="$1"
-  
+function discover_proxmox_hosts() {  
   # First check if we're running on a Proxmox host
   if command -v pvecm &>/dev/null; then
     # We're on a Proxmox host, so use local command
@@ -660,15 +791,113 @@ function generate_sample_config() {
   api_server=$(ssh -p "$SSH_PORT" root@$control_plane_node "cat /etc/rancher/k3s/k3s.yaml | grep server: | awk '{print \$2}'" 2>/dev/null)
   log_info "Detected API server: $api_server"
   
-  # Step 6: Discover Proxmox hosts if possible
+  # Step 6: Attempt to discover Proxmox VM details first if running on a Proxmox host
+  log_info "Attempting to discover VM details from Proxmox..."
+  discover_node_proxmox_details
+
+  # Step 7: Discover Proxmox hosts if needed
   log_info "Discovering Proxmox hosts..."
-  discover_proxmox_hosts "$control_plane_node"
+  discover_proxmox_hosts
+
+  # Re-attempt discovery of VM details if we found hosts but not VM details
+  if [[ ${#PROXMOX_HOSTS[@]} -gt 0 ]]; then
+    # Check if we're missing any VM details
+    local missing_details=false
+    for node in "${NODES[@]}"; do
+      local details="${NODE_DETAILS[$node]}"
+      if [[ "$details" == *"proxmox_vmid=,"* || "$details" == *"proxmox_host=,"* ]]; then
+        missing_details=true
+        break
+      fi
+    done
+    
+    if [[ "$missing_details" == "true" ]]; then
+      log_info "Re-discovering node VM details with Proxmox host information..."
+      discover_node_proxmox_details
+    fi
+  fi
   
-  # Step7: Detect storage configurations
+  # After all automatic discovery attempts, check for any missing details
+  for node in "${NODES[@]}"; do
+    local details="${NODE_DETAILS[$node]}"
+    
+    # Parse details to check if VM ID and host are set
+    local vm_id=""
+    local proxmox_host=""
+    
+    IFS=',' read -ra detail_parts <<< "$details"
+    for part in "${detail_parts[@]}"; do
+      key="${part%%=*}"
+      value="${part#*=}"
+      
+      case "$key" in
+        proxmox_vmid) vm_id="$value" ;;
+        proxmox_host) proxmox_host="$value" ;;
+      esac
+    done
+    
+    # If VM ID or host is missing, ask user
+    if [[ -z "$vm_id" || -z "$proxmox_host" ]]; then
+      log_warn "Missing Proxmox details for node $node"
+      
+      # Ask for VM ID if missing
+      if [[ -z "$vm_id" ]]; then
+        read -p "Enter VM ID for node $node (leave empty to skip): " vm_id
+      fi
+      
+      # Ask for Proxmox host if missing
+      if [[ -n "$vm_id" && -z "$proxmox_host" ]]; then
+        if [[ ${#PROXMOX_HOSTS[@]} -eq 1 ]]; then
+          # If only one Proxmox host, use it by default
+          proxmox_host="${PROXMOX_HOSTS[0]}"
+          log_info "Using only available Proxmox host: $proxmox_host"
+        else
+          # List available hosts for selection
+          if [[ ${#PROXMOX_HOSTS[@]} -gt 0 ]]; then
+            echo "Available Proxmox hosts:"
+            for i in "${!PROXMOX_HOSTS[@]}"; do
+              echo "$((i+1)). ${PROXMOX_HOSTS[$i]}"
+            done
+            read -p "Enter Proxmox host number for VM $vm_id: " host_idx
+            
+            if [[ "$host_idx" =~ ^[0-9]+$ && "$host_idx" -ge 1 && "$host_idx" -le "${#PROXMOX_HOSTS[@]}" ]]; then
+              proxmox_host="${PROXMOX_HOSTS[$((host_idx-1))]}"
+            else
+              read -p "Enter Proxmox host for VM $vm_id: " proxmox_host
+            fi
+          else
+            read -p "Enter Proxmox host for VM $vm_id: " proxmox_host
+          fi
+        fi
+      fi
+      
+      # Update node details with user-provided information
+      if [[ -n "$vm_id" || -n "$proxmox_host" ]]; then
+        local ip=""
+        local role="worker"
+        
+        IFS=',' read -ra detail_parts <<< "$details"
+        for part in "${detail_parts[@]}"; do
+          key="${part%%=*}"
+          value="${part#*=}"
+          
+          case "$key" in
+            ip) ip="$value" ;;
+            role) role="$value" ;;
+          esac
+        done
+        
+        NODE_DETAILS["$node"]="ip=$ip,role=$role,proxmox_vmid=$vm_id,proxmox_host=$proxmox_host"
+        log_info "Updated details for node $node: VM ID=$vm_id, Proxmox Host=$proxmox_host"
+      fi
+    fi
+  done
+  
+  # Step 8: Detect storage configurations
   log_info "Detecting storage configurations..."
   discover_storage_config "$control_plane_node"
   
-  # Step 8: Generate config file
+  # Step 9: Generate config file
   log_info "Generating configuration file at $output_file..."
   create_config_from_discovery "$output_file"
   

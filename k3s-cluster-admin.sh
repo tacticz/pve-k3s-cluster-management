@@ -19,12 +19,12 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Load modules
+source "${SCRIPT_DIR}/lib/utils.sh"
 source "${SCRIPT_DIR}/lib/config.sh"
 source "${SCRIPT_DIR}/lib/validation.sh"
 source "${SCRIPT_DIR}/lib/node_ops.sh"
 source "${SCRIPT_DIR}/lib/backup.sh"
 source "${SCRIPT_DIR}/lib/restore.sh"
-source "${SCRIPT_DIR}/lib/utils.sh"
 
 # Default configuration values
 DEFAULT_CONFIG_FILE="${SCRIPT_DIR}/conf/cluster-config.yaml"
