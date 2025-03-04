@@ -7,7 +7,15 @@
 #
 # Author: S-tor + claude.ai
 # Date: February 2025
-# Version: 0.1.0
+# Version: 0.1.1
+
+# Global variables for discovery
+declare -a NODES
+declare -A NODE_DETAILS
+declare -a PROXMOX_HOSTS
+PROXMOX_STORAGE=""
+BACKUP_LOCATION=""
+SSH_PORT="22"
 
 # Require yq for YAML parsing
 function check_dependencies() {
@@ -16,6 +24,443 @@ function check_dependencies() {
     log_info "You can install it with: sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq"
     exit 1
   fi
+}
+
+# Verify SSH access to a node
+function verify_ssh_access() {
+  local node="$1"
+  local port="${2:-$SSH_PORT}"
+  
+  ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$port" root@$node "echo 'OK'" &>/dev/null
+  return $?
+}
+
+# Initial SSH connection to accept fingerprint
+function initial_ssh_connection() {
+  local node="$1"
+  local port="${2:-$SSH_PORT}"
+  
+  log_info "Verifying SSH fingerprint for $node:$port..."
+  
+  # Save current FORCE value and temporarily set it to false
+  local original_force="$FORCE"
+  FORCE="false"
+  
+  # Ask user whether to trust the host automatically
+  if confirm "Would you like to automatically accept the SSH fingerprint for $node?"; then
+    # Using StrictHostKeyChecking=no to automatically accept the fingerprint
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p "$port" root@$node "echo Connection established" &>/dev/null
+    local status=$?
+    
+    # Restore original FORCE value
+    FORCE="$original_force"
+    
+    if [[ $status -eq 0 ]]; then
+      log_success "SSH fingerprint accepted for $node"
+      return 0
+    else
+      log_error "Failed to establish SSH connection to $node"
+      return 1
+    fi
+  else
+    # Restore original FORCE value
+    FORCE="$original_force"
+    
+    # Manual verification - instruct the user
+    log_info "Please manually verify the SSH fingerprint by connecting to the node:"
+    log_info "Run: ssh -p $port root@$node"
+    log_info "After verification is complete, press Enter to continue"
+    read -p "Press Enter when done..." confirm
+    
+    # Check if the connection works now
+    if verify_ssh_access "$node" "$port"; then
+      log_success "SSH connection verified for $node"
+      return 0
+    else
+      log_error "SSH connection still failing for $node"
+      return 1
+    fi
+  fi
+}
+
+# Setup SSH key authentication
+function setup_ssh_key() {
+  local node="$1"
+  local port="${2:-$SSH_PORT}"
+  local ssh_key_path="${SSH_KEY_PATH:-~/.ssh/id_rsa}"
+  
+  # Check if SSH key exists
+  if [[ ! -f "$ssh_key_path" ]]; then
+    log_info "SSH key not found at $ssh_key_path"
+    if confirm "Would you like to generate a new SSH key?"; then
+      ssh-keygen -t rsa -b 4096 -f "$ssh_key_path" -N "" || return 1
+    else
+      return 1
+    fi
+  fi
+  
+  # First establish initial connection to handle fingerprint verification
+  initial_ssh_connection "$node" "$port" || return 1
+  
+  # Ask for password to copy SSH key
+  log_info "Please enter the password for root@$node when prompted"
+  ssh-copy-id -i "$ssh_key_path" -p "$port" root@$node || return 1
+  
+  # Verify access
+  if verify_ssh_access "$node" "$port"; then
+    log_success "SSH key authentication set up successfully"
+    return 0
+  else
+    log_error "SSH key authentication setup failed"
+    return 1
+  fi
+}
+
+# Discover cluster nodes
+function discover_cluster_nodes() {
+  local control_node="$1"
+  
+  # Get nodes using kubectl
+  log_info "Getting nodes via kubectl from $control_node..."
+  local node_list=$(ssh -p "$SSH_PORT" root@$control_node "kubectl get nodes -o=jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}'" 2>/dev/null)
+  
+  if [[ -z "$node_list" ]]; then
+    log_error "Failed to get nodes from the cluster"
+    return 1
+  fi
+  
+  # Store nodes in the global array
+  readarray -t NODES <<< "$node_list"
+  log_info "Discovered nodes: ${NODES[*]}"
+  
+  # Get node details
+  for node in "${NODES[@]}"; do
+    # Try to get IP address
+    local node_ip=$(ssh -p "$SSH_PORT" root@$control_node "kubectl get node $node -o=jsonpath='{.status.addresses[?(@.type==\"InternalIP\")].address}'" 2>/dev/null)
+    
+    # Get node role (master or worker)
+    local is_master=$(ssh -p "$SSH_PORT" root@$control_node "kubectl get node $node -o=jsonpath='{.metadata.labels.node-role\\.kubernetes\\.io/master}'" 2>/dev/null)
+    local is_controlplane=$(ssh -p "$SSH_PORT" root@$control_node "kubectl get node $node -o=jsonpath='{.metadata.labels.node-role\\.kubernetes\\.io/control-plane}'" 2>/dev/null)
+    
+    local role="worker"
+    if [[ -n "$is_master" || -n "$is_controlplane" ]]; then
+      role="master"
+    fi
+    
+    log_info "Node $node: IP=$node_ip, Role=$role"
+    
+    # Check SSH access to this node
+    if ! verify_ssh_access "$node" "$SSH_PORT"; then
+      log_warn "Cannot SSH to $node with key authentication"
+      
+      # First try initial connection to handle fingerprint
+      initial_ssh_connection "$node" "$SSH_PORT"
+      
+      # If still can't access with key, offer to set up SSH key
+      if ! verify_ssh_access "$node" "$SSH_PORT"; then
+        if confirm "Would you like to set up SSH key authentication for $node?"; then
+          setup_ssh_key "$node" "$SSH_PORT" || log_warn "Failed to set up SSH key authentication for $node"
+        fi
+      fi
+    fi
+    
+    # Try to get Proxmox VM ID and host
+    local vm_id=""
+    local proxmox_host=""
+    
+    # Try to get VM ID from Proxmox hosts
+    for host in "${PROXMOX_HOSTS[@]}"; do
+      if verify_ssh_access "$host"; then
+        vm_id=$(ssh -p "$SSH_PORT" root@$host "qm list | grep $node | awk '{print \$1}'" 2>/dev/null)
+        if [[ -n "$vm_id" ]]; then
+          proxmox_host="$host"
+          break
+        fi
+      fi
+    done
+    
+    # Store node details
+    NODE_DETAILS["$node"]="ip=$node_ip,role=$role,proxmox_vmid=$vm_id,proxmox_host=$proxmox_host"
+  done
+  
+  return 0
+}
+
+# Discover Proxmox hosts
+function discover_proxmox_hosts() {
+  local node="$1"
+  
+  # First check if we're running on a Proxmox host
+  if command -v pvecm &>/dev/null; then
+    # We're on a Proxmox host, so use local command
+    log_info "Detected script running on a Proxmox host, getting cluster information locally..."
+    local pvecm_output=$(pvecm status 2>/dev/null)
+    
+    if [[ -n "$pvecm_output" ]]; then
+      # Extract hosts from membership information
+      local hosts=$(echo "$pvecm_output" | grep -A 100 "Membership information" | grep -B 100 -m 1 "^$" | grep -v "Membership information" | grep -v "^--" | grep -v "^$" | awk '{print $NF}' | sort | uniq)
+      
+      if [[ -n "$hosts" ]]; then
+        readarray -t PROXMOX_HOSTS <<< "$hosts"
+        log_info "Discovered Proxmox hosts: ${PROXMOX_HOSTS[*]}"
+        
+        # Try to get storage info
+        discover_proxmox_storage
+        return 0
+      fi
+    fi
+  fi
+  
+  # If we reach here, either we're not on a Proxmox host or couldn't get info
+  log_info "Trying to detect Proxmox environment..."
+  
+  # Check if we're on a Proxmox host but pvecm failed
+  if [ -f /etc/pve/storage.cfg ]; then
+    log_info "Found Proxmox storage configuration file, running on a Proxmox host"
+    # Get local hostname
+    local hostname=$(hostname -f)
+    PROXMOX_HOSTS=("$hostname")
+    log_info "Using local Proxmox host: $hostname"
+    
+    # Try to get storage info
+    discover_proxmox_storage
+    return 0
+  fi
+  
+  # Not running on Proxmox, ask user for information
+  log_warn "Not running on a Proxmox host or unable to detect Proxmox environment"
+  read -p "Enter comma-separated list of Proxmox hosts: " proxmox_hosts_input
+  if [[ -n "$proxmox_hosts_input" ]]; then
+    IFS=',' read -ra PROXMOX_HOSTS <<< "$proxmox_hosts_input"
+    log_info "Using Proxmox hosts: ${PROXMOX_HOSTS[*]}"
+    
+    # Check SSH access to Proxmox hosts
+    for host in "${PROXMOX_HOSTS[@]}"; do
+      if ! verify_ssh_access "$host" "$SSH_PORT"; then
+        log_warn "Cannot SSH to Proxmox host $host with key authentication"
+        
+        # Try initial connection first
+        initial_ssh_connection "$host" "$SSH_PORT"
+        
+        # If still can't access with key, offer to set up SSH key
+        if ! verify_ssh_access "$host" "$SSH_PORT"; then
+          if confirm "Would you like to set up SSH key authentication for $host?"; then
+            setup_ssh_key "$host" "$SSH_PORT" || log_warn "Failed to set up SSH key authentication for $host"
+          fi
+        fi
+      fi
+    done
+    
+    # Try to get storage info
+    discover_proxmox_storage
+  else
+    log_warn "No Proxmox hosts specified, skipping Proxmox integration"
+  fi
+  
+  return 0
+}
+
+# Discover Proxmox storage
+function discover_proxmox_storage() {
+  # First check if we're running on a Proxmox host
+  if command -v pvesm &>/dev/null; then
+    # We're on a Proxmox host, use local command
+    log_info "Getting storage information from local Proxmox system..."
+    local storage_output=$(pvesm status 2>/dev/null)
+    
+    if [[ -n "$storage_output" ]]; then
+      # Look for cephfs storage
+      local cephfs_storage=$(echo "$storage_output" | grep "cephfs" | awk '{print $1}' | head -1)
+      
+      if [[ -n "$cephfs_storage" ]]; then
+        PROXMOX_STORAGE="$cephfs_storage"
+        log_info "Discovered Proxmox CephFS storage: $PROXMOX_STORAGE"
+        return 0
+      else
+        # Look for any shared storage
+        local shared_storage=$(echo "$storage_output" | grep -v "local" | grep -v "^Name" | awk '{print $1}' | head -1)
+        
+        if [[ -n "$shared_storage" ]]; then
+          PROXMOX_STORAGE="$shared_storage"
+          log_info "Discovered Proxmox shared storage: $PROXMOX_STORAGE"
+          return 0
+        fi
+      fi
+    fi
+  fi
+  
+  # If not running on a Proxmox host or local command failed, try SSH to hosts
+  for host in "${PROXMOX_HOSTS[@]}"; do
+    if verify_ssh_access "$host" "$SSH_PORT"; then
+      log_info "Getting storage information from Proxmox host $host..."
+      local storage_output=$(ssh -p "$SSH_PORT" root@$host "pvesm status" 2>/dev/null)
+      
+      if [[ -n "$storage_output" ]]; then
+        # Look for cephfs storage
+        local cephfs_storage=$(echo "$storage_output" | grep "cephfs" | awk '{print $1}' | head -1)
+        
+        if [[ -n "$cephfs_storage" ]]; then
+          PROXMOX_STORAGE="$cephfs_storage"
+          log_info "Discovered Proxmox CephFS storage: $PROXMOX_STORAGE"
+          return 0
+        else
+          # Look for any shared storage
+          local shared_storage=$(echo "$storage_output" | grep -v "local" | grep -v "^Name" | awk '{print $1}' | head -1)
+          
+          if [[ -n "$shared_storage" ]]; then
+            PROXMOX_STORAGE="$shared_storage"
+            log_info "Discovered Proxmox shared storage: $PROXMOX_STORAGE"
+            return 0
+          fi
+        fi
+      fi
+    fi
+  done
+  
+  # If still no storage found, ask user
+  if [[ -z "$PROXMOX_STORAGE" ]]; then
+    log_warn "Could not discover Proxmox storage"
+    read -p "Enter Proxmox storage name for backups and VMs: " PROXMOX_STORAGE
+    if [[ -n "$PROXMOX_STORAGE" ]]; then
+      log_info "Using storage: $PROXMOX_STORAGE"
+    fi
+  fi
+  
+  return 0
+}
+
+# Discover storage configuration
+function discover_storage_config() {
+  local node="$1"
+  
+  # Check for CephFS mount
+  local cephfs_mount=$(ssh -p "$SSH_PORT" root@$node "mount | grep cephfs" 2>/dev/null)
+  
+  if [[ -n "$cephfs_mount" ]]; then
+    local mount_point=$(echo "$cephfs_mount" | awk '{print $3}' | head -1)
+    BACKUP_LOCATION="$mount_point"
+    log_info "Discovered CephFS mount point: $BACKUP_LOCATION"
+  else
+    log_warn "No CephFS mount found"
+    BACKUP_LOCATION="/mnt/backup"
+    log_info "Using default backup location: $BACKUP_LOCATION"
+  fi
+}
+
+# Create config from discovered information
+function create_config_from_discovery() {
+  local output_file="$1"
+  
+  cat > "$output_file" <<EOF
+# K3s Cluster Admin Configuration
+---
+cluster:
+  name: $cluster_name
+  api_server: $api_server
+
+# Nodes in the cluster
+nodes:
+EOF
+  
+  # Add nodes
+  for node in "${NODES[@]}"; do
+    echo "  - $node" >> "$output_file"
+  done
+  
+  # Add node details
+  cat >> "$output_file" <<EOF
+
+# Node details (IP addresses, VM IDs, etc.)
+node_details:
+EOF
+  
+  for node in "${NODES[@]}"; do
+    local details="${NODE_DETAILS[$node]}"
+    IFS=',' read -ra detail_parts <<< "$details"
+    
+    local ip=""
+    local role="worker"
+    local vmid=""
+    local proxmox_host=""
+    
+    for part in "${detail_parts[@]}"; do
+      key="${part%%=*}"
+      value="${part#*=}"
+      
+      case "$key" in
+        ip) ip="$value" ;;
+        role) role="$value" ;;
+        proxmox_vmid) vmid="$value" ;;
+        proxmox_host) proxmox_host="$value" ;;
+      esac
+    done
+    
+    cat >> "$output_file" <<EOF
+  $node:
+    ip: $ip
+    proxmox_vmid: $vmid
+    proxmox_host: $proxmox_host
+    role: $role
+EOF
+  done
+  
+  # Add remaining configuration
+  cat >> "$output_file" <<EOF
+
+# Retention policy
+retention:
+  count: 5
+  max_age_days: 30
+
+# Operation timeouts (in seconds)
+timeouts:
+  draining: 300
+  operation: 600
+
+# Validation settings
+validation:
+  level: basic  # basic, extended, full
+  etcd: true
+  storage: true
+  network: true
+
+# Proxmox settings
+proxmox:
+  hosts:
+EOF
+  
+  # Add Proxmox hosts
+  for host in "${PROXMOX_HOSTS[@]}"; do
+    echo "    - $host" >> "$output_file"
+  done
+  
+  cat >> "$output_file" <<EOF
+  user: root
+  storage: $PROXMOX_STORAGE
+  templates:
+    master: 9000  # Template VM ID for master node (placeholder)
+    worker: 9001  # Template VM ID for worker node (placeholder)
+
+# Backup settings
+backup:
+  prefix: k3s-backup
+  location: $BACKUP_LOCATION
+  compress: true
+  include_etcd: true
+
+# Notification settings
+notifications:
+  enabled: false
+  email: admin@example.com
+
+# Advanced settings
+advanced:
+  verbose: false
+  debug: false
+  ssh_key_path: ~/.ssh/id_rsa
+  kubectl_path: /usr/local/bin/kubectl
+  ssh_port: $SSH_PORT
+EOF
 }
 
 # Load configuration from YAML file
@@ -35,6 +480,7 @@ function load_config() {
   # Cluster configuration
   CLUSTER_NAME=$(yq -r '.cluster.name // ""' "$config_file")
   K3S_API_SERVER=$(yq -r '.cluster.api_server // ""' "$config_file")
+  SSH_PORT=$(yq -r '.advanced.ssh_port // "22"' "$config_file")
   
   # Operation parameters
   CONFIG_RETENTION_COUNT=$(yq -r '.retention.count // 0' "$config_file")
@@ -132,14 +578,107 @@ function print_config() {
   echo "==========================="
 }
 
-# Generate a sample configuration file
+# Interactive config generation
 function generate_sample_config() {
   local output_file="$1"
+  local interactive="${2:-false}"
   
   if [[ -f "$output_file" ]] && [[ "$FORCE" != "true" ]]; then
     log_error "Configuration file $output_file already exists. Use --force to overwrite."
     return 1
   fi
+  
+  # If not in interactive mode, generate static sample
+  if [[ "$interactive" != "true" ]]; then
+    create_static_sample_config "$output_file"
+    return $?
+  fi
+  
+  # Interactive config generation
+  log_section "Interactive Configuration Generation"
+  
+  # Collect cluster information
+  local cluster_name=""
+  local control_plane_node=""
+  local api_server=""
+  local nodes=()
+  local node_details=()
+  local proxmox_hosts=()
+  local proxmox_storage=""
+  
+  # Step 1: Ask for cluster name
+  read -p "Enter k3s cluster name [k3s-cluster]: " cluster_name
+  cluster_name="${cluster_name:-k3s-cluster}"
+  log_info "Using cluster name: $cluster_name"
+  
+  # Step 2: Ask for SSH port
+  read -p "Enter SSH port for nodes [22]: " ssh_port_input
+  SSH_PORT="${ssh_port_input:-22}"
+  log_info "Using SSH port: $SSH_PORT"
+  
+  # Step 3: Ask for control plane node
+  read -p "Enter one of your k3s control plane nodes (hostname or IP): " control_plane_node
+  if [[ -z "$control_plane_node" ]]; then
+    log_error "Control plane node is required"
+    return 1
+  fi
+  
+  # Step 4: Verify SSH access
+  log_info "Checking SSH access to $control_plane_node on port $SSH_PORT..."
+
+  # First try to establish initial connection if needed
+  if ! verify_ssh_access "$control_plane_node" "$SSH_PORT"; then
+    log_info "Initial SSH connection required for $control_plane_node"
+    initial_ssh_connection "$control_plane_node" "$SSH_PORT" || {
+      log_error "Failed to establish initial SSH connection"
+      return 1
+    }
+    
+    # Now check if we need to set up SSH key authentication
+    if ! verify_ssh_access "$control_plane_node" "$SSH_PORT"; then
+      log_warn "Cannot SSH to $control_plane_node with key authentication"
+      if confirm "Would you like to set up SSH key authentication?"; then
+        setup_ssh_key "$control_plane_node" "$SSH_PORT" || {
+          log_error "Failed to set up SSH key authentication"
+          return 1
+        }
+      else
+        log_error "SSH access is required for cluster discovery"
+        return 1
+      fi
+    fi
+  fi
+  
+  # Step 5: Discover cluster nodes
+  log_info "Discovering k3s cluster nodes..."
+  if ! discover_cluster_nodes "$control_plane_node"; then
+    log_error "Failed to discover cluster nodes"
+    return 1
+  fi
+  
+  # Get API server address
+  api_server=$(ssh -p "$SSH_PORT" root@$control_plane_node "cat /etc/rancher/k3s/k3s.yaml | grep server: | awk '{print \$2}'" 2>/dev/null)
+  log_info "Detected API server: $api_server"
+  
+  # Step 6: Discover Proxmox hosts if possible
+  log_info "Discovering Proxmox hosts..."
+  discover_proxmox_hosts "$control_plane_node"
+  
+  # Step7: Detect storage configurations
+  log_info "Detecting storage configurations..."
+  discover_storage_config "$control_plane_node"
+  
+  # Step 8: Generate config file
+  log_info "Generating configuration file at $output_file..."
+  create_config_from_discovery "$output_file"
+  
+  log_success "Configuration generated at $output_file"
+  return 0
+}
+
+# Create static sample config (original function)
+function create_static_sample_config() {
+  local output_file="$1"
   
   cat > "$output_file" <<EOF
 # K3s Cluster Admin Configuration
@@ -197,11 +736,14 @@ proxmox:
     - hasrv3.ldv.corp
   user: root
   storage: pvecephfs-1-k3s
+  templates:
+    master: 9000  # Template VM ID for master node
+    worker: 9001  # Template VM ID for worker node
 
 # Backup settings
 backup:
   prefix: k3s-backup
-  location: /mnt/pve/pvecephfs-1-backup
+  location: /mnt/pvecephfs-1-backup
   compress: true
   include_etcd: true
 
@@ -218,6 +760,6 @@ advanced:
   kubectl_path: /usr/local/bin/kubectl
 EOF
 
-  log_info "Sample configuration generated at $output_file"
+  log_info "Static sample configuration generated at $output_file"
   return 0
 }

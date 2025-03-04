@@ -6,7 +6,7 @@
 #
 # Author: S-tor + claude.ai
 # Date: February 2025
-# Version: 0.1.0
+# Version: 0.1.1
 
 # Log levels
 LOG_ERROR=1
@@ -347,10 +347,10 @@ function run_interactive_mode() {
       # Interactive restore
       run_restore_wizard
       ;;
-    
+      
     8)
       # Generate sample config
-      read -p "Enter output file path: " config_path
+      read -p "Enter config file name or path: " config_path
       
       if [[ -z "$config_path" ]]; then
         config_path="cluster-config-sample.yaml"
@@ -364,10 +364,10 @@ function run_interactive_mode() {
       fi
       
       FORCE="true"
-      generate_sample_config "$config_path"
+      generate_sample_config "$config_path" "true"  # Pass "true" to indicate interactive mode
       FORCE="false"
       ;;
-    
+
     9)
       log_info "Exiting interactive mode"
       return 0
