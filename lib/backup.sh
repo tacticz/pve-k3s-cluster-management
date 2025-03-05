@@ -123,8 +123,14 @@ function backup_cluster() {
     # Create backup
     local backup_cmd="vzdump $vm_id --compress --mode snapshot"
     
-    if [[ -n "$PROXMOX_STORAGE" ]]; then
-      backup_cmd="$backup_cmd --storage $PROXMOX_STORAGE"
+    local backup_storage=$(yq -r ".backup.storage // \"\"" "$CONFIG_FILE")
+    if [[ -z "$backup_storage" ]]; then
+      log_warn "No backup storage specified in config. Using default Proxmox storage."
+      backup_storage="$PROXMOX_STORAGE"
+    fi
+
+    if [[ -n "$backup_storage" ]]; then
+      backup_cmd="$backup_cmd --storage $backup_storage"
     fi
     
     backup_cmd="$backup_cmd --description \"K3s cluster backup - Node: $node - Timestamp: $TIMESTAMP - Etcd: $etcd_snapshot_name\""

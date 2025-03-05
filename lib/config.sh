@@ -10,7 +10,7 @@ declare -a NODES
 declare -A NODE_DETAILS
 declare -a PROXMOX_HOSTS
 PROXMOX_STORAGE=""
-BACKUP_LOCATION=""
+BACKUP_STORAGE=""
 SSH_PORT="22"
 
 # Require yq for YAML parsing
@@ -370,7 +370,29 @@ function discover_proxmox_hosts() {
         log_info "Discovered Proxmox hosts: ${PROXMOX_HOSTS[*]}"
         
         # Try to get storage info
-        discover_proxmox_storage
+        discover_proxmox_storage_details
+        # If that failed, fall back to the standard discovery
+        if [[ -z "$PROXMOX_STORAGE" || -z "$BACKUP_STORAGE" ]]; then
+          log_info "Falling back to basic storage discovery..."
+          discover_proxmox_storage
+        fi
+
+        if [[ -z "$BACKUP_STORAGE" ]]; then
+          # If no specific backup storage was found, look for backup storage in name
+          for host in "${PROXMOX_HOSTS[@]}"; do
+            if verify_ssh_access "$host" "$SSH_PORT"; then
+              local storage_output=$(ssh -p "$SSH_PORT" root@$host "pvesm status" 2>/dev/null)
+              if [[ -n "$storage_output" ]]; then
+                local backup_storage=$(echo "$storage_output" | grep -E "backup" | awk '{print $1}' | head -1)
+                if [[ -n "$backup_storage" ]]; then
+                  BACKUP_STORAGE="$backup_storage"
+                  log_info "Found backup storage: $BACKUP_STORAGE"
+                  break
+                fi
+              fi
+            fi
+          done
+        fi
         
         # Try to discover templates
         discover_proxmox_templates
@@ -656,6 +678,15 @@ function discover_proxmox_storage() {
           fi
         fi
       fi
+
+      # Look for backup-specific storage
+      local backup_storage=$(echo "$storage_output" | grep -E "cephfs.*backup|backup" | awk '{print $1}' | head -1)
+
+      if [[ -n "$backup_storage" ]]; then
+        BACKUP_STORAGE="$backup_storage"
+        log_info "Discovered Proxmox backup storage: $BACKUP_STORAGE"
+        return 0
+      fi
     fi
   done
   
@@ -665,6 +696,59 @@ function discover_proxmox_storage() {
     read -p "Enter Proxmox storage name for k3s storage (cephfs preferred): " PROXMOX_STORAGE
     if [[ -n "$PROXMOX_STORAGE" ]]; then
       log_info "Using storage: $PROXMOX_STORAGE"
+    fi
+  fi
+  
+  return 0
+}
+
+# Discover Proxmox storage details
+function discover_proxmox_storage_details() {
+  log_info "Getting detailed storage information from Proxmox..."
+  
+  local storage_json=""
+  
+  # Try to get storage info using pvesh locally first
+  if command -v pvesh &>/dev/null; then
+    storage_json=$(pvesh get /storage --output-format json 2>/dev/null)
+  fi
+  
+  # If local command failed, try via SSH to one of the Proxmox hosts
+  if [[ -z "$storage_json" ]] && [[ ${#PROXMOX_HOSTS[@]} -gt 0 ]]; then
+    for host in "${PROXMOX_HOSTS[@]}"; do
+      if verify_ssh_access "$host" "$SSH_PORT"; then
+        storage_json=$(ssh -p "$SSH_PORT" ${PROXMOX_USER}@$host "pvesh get /storage --output-format json" 2>/dev/null)
+        if [[ -n "$storage_json" ]]; then
+          break
+        fi
+      fi
+    done
+  fi
+  
+  if [[ -z "$storage_json" ]]; then
+    log_warn "Failed to get storage details using pvesh"
+    return 1
+  fi
+  
+  # Parse JSON to find suitable storage
+  # Look for storage with 'backup' in content for BACKUP_STORAGE
+  local backup_storage=$(echo "$storage_json" | grep -o '{[^}]*"content":[^}]*backup[^}]*}' | grep -o '"storage":"[^"]*"' | cut -d ':' -f2 | tr -d '"' | head -1)
+  if [[ -n "$backup_storage" ]]; then
+    BACKUP_STORAGE="$backup_storage"
+    log_info "Found storage with backup content type: $BACKUP_STORAGE"
+  fi
+  
+  # Look for storage with 'images' in content for PROXMOX_STORAGE (VM storage)
+  local vm_storage=$(echo "$storage_json" | grep -o '{[^}]*"content":[^}]*images[^}]*}' | grep -o '"storage":"[^"]*"' | cut -d ':' -f2 | tr -d '"' | head -1)
+  if [[ -n "$vm_storage" ]]; then
+    # If there's a storage with 'k3s' in the name, prioritize it
+    if echo "$storage_json" | grep -q '{[^}]*"storage":"[^"]*k3s[^"]*"[^}]*"content":[^}]*images[^}]*}'; then
+      local k3s_storage=$(echo "$storage_json" | grep -o '{[^}]*"storage":"[^"]*k3s[^"]*"[^}]*"content":[^}]*images[^}]*}' | grep -o '"storage":"[^"]*"' | cut -d ':' -f2 | tr -d '"' | head -1)
+      PROXMOX_STORAGE="$k3s_storage"
+      log_info "Found k3s-specific storage for VMs: $PROXMOX_STORAGE"
+    else
+      PROXMOX_STORAGE="$vm_storage"
+      log_info "Found general VM storage: $PROXMOX_STORAGE"
     fi
   fi
   
@@ -799,12 +883,18 @@ EOF
 EOF
   fi
 
+  if [[ -z "$BACKUP_STORAGE" ]]; then
+    # If no specific backup storage was found, use the same as PROXMOX_STORAGE as fallback
+    BACKUP_STORAGE="$PROXMOX_STORAGE"
+    log_info "No specific backup storage found, using: $BACKUP_STORAGE as fallback"
+  fi
+
   cat >> "$output_file" <<EOF
 
 # Backup settings
 backup:
   prefix: k3s-backup
-  location: $BACKUP_LOCATION
+  storage: $BACKUP_STORAGE
   compress: true
   include_etcd: true
 
@@ -860,7 +950,7 @@ function load_config() {
   
   # Backup settings
   BACKUP_PREFIX=$(yq -r '.backup.prefix // "k3s-backup"' "$config_file")
-  BACKUP_LOCATION=$(yq -r '.backup.location // ""' "$config_file")
+  BACKUP_STORAGE=$(yq -r '.backup.storage // ""' "$CONFIG_FILE")
   
   # Notification settings
   NOTIFY_ENABLED=$(yq -r '.notifications.enabled // "false"' "$config_file")
@@ -1131,6 +1221,18 @@ function generate_sample_config() {
   # Step 8: Detect storage configurations
   log_info "Detecting storage configurations..."
   discover_storage_config "$control_plane_node"
+
+  # Ensure useer is prompted for backup storage if none was detected
+  log_info "Detecting backup storage..."
+  if [[ -z "$BACKUP_STORAGE" ]]; then
+    read -p "Enter Proxmox storage for backups (leave empty to use $PROXMOX_STORAGE): " backup_storage_input
+    if [[ -n "$backup_storage_input" ]]; then
+      BACKUP_STORAGE="$backup_storage_input"
+    else
+      BACKUP_STORAGE="$PROXMOX_STORAGE"
+    fi
+  fi
+  log_info "Using backup storage: $BACKUP_STORAGE"
   
   # Step 9: Generate config file
   log_info "Generating configuration file at $output_file..."
@@ -1207,7 +1309,7 @@ proxmox:
 # Backup settings
 backup:
   prefix: k3s-backup
-  location: /mnt/pvecephfs-1-backup
+  storage: pvecephfs-1-backup
   compress: true
   include_etcd: true
 
