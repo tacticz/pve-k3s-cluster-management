@@ -184,6 +184,36 @@ function discover_node_proxmox_details() {
   return 0
 }
 
+# Detect node architecture
+function detect_node_architecture() {
+  local node="$1"
+  local port="${2:-$SSH_PORT}"
+  
+  if verify_ssh_access "$node" "$port"; then
+    # Try to get architecture using uname
+    local arch=$(ssh -p "$port" root@$node "uname -m" 2>/dev/null)
+    
+    # Map architecture to amd64 or arm64
+    case "$arch" in
+      x86_64)
+        echo "amd64"
+        ;;
+      aarch64)
+        echo "arm64"
+        ;;
+      *)
+        # Default to amd64 if unknown
+        log_warn "Unknown architecture: $arch, defaulting to amd64"
+        echo "amd64"
+        ;;
+    esac
+  else
+    # Default to amd64 if can't SSH
+    log_warn "Cannot detect architecture for $node, defaulting to amd64"
+    echo "amd64"
+  fi
+}
+
 # Discover cluster nodes
 function discover_cluster_nodes() {
   local control_node="$1"
@@ -232,8 +262,12 @@ function discover_cluster_nodes() {
       fi
     fi
     
+    # Detect node architecture
+    local arch=$(detect_node_architecture "$node" "$SSH_PORT")
+    log_info "Node $node: IP=$node_ip, Role=$role, Architecture=$arch"
+
     # Store basic node details - VM ID and host will be added later
-    NODE_DETAILS["$node"]="ip=$node_ip,role=$role,proxmox_vmid=,proxmox_host="
+    NODE_DETAILS["$node"]="ip=$node_ip,role=$role,proxmox_vmid=,proxmox_host=,arch=$arch"
   done
   
   # Attempt to discover VM details directly from Proxmox API
@@ -298,7 +332,8 @@ function discover_cluster_nodes() {
       if [[ -n "$vm_id" || -n "$proxmox_host" ]]; then
         local ip=""
         local role="worker"
-        
+        local arch="amd64"  # Default to amd64 if not found
+
         IFS=',' read -ra detail_parts <<< "$details"
         for part in "${detail_parts[@]}"; do
           key="${part%%=*}"
@@ -307,10 +342,13 @@ function discover_cluster_nodes() {
           case "$key" in
             ip) ip="$value" ;;
             role) role="$value" ;;
+            proxmox_vmid) vm_id="$value" ;;
+            proxmox_host) proxmox_host="$value" ;;
+            arch) arch="$value" ;;  # Extract architecture from existing details
           esac
         done
         
-        NODE_DETAILS["$node"]="ip=$ip,role=$role,proxmox_vmid=$vm_id,proxmox_host=$proxmox_host"
+        NODE_DETAILS["$node"]="ip=$ip,role=$role,proxmox_vmid=$vm_id,proxmox_host=$proxmox_host,arch=$arch"
         log_info "Updated details for node $node: VM ID=$vm_id, Proxmox Host=$proxmox_host"
       fi
     fi
@@ -320,7 +358,7 @@ function discover_cluster_nodes() {
 }
 
 # Discover Proxmox hosts
-function discover_proxmox_hosts() {  
+function discover_proxmox_hosts() {
   # First check if we're running on a Proxmox host
   if command -v pvecm &>/dev/null; then
     # We're on a Proxmox host, so use local command
@@ -337,6 +375,33 @@ function discover_proxmox_hosts() {
         
         # Try to get storage info
         discover_proxmox_storage
+        
+        # Try to discover templates
+        discover_proxmox_templates
+        return 0
+      fi
+    fi
+  fi
+  
+  # If we're not on a Proxmox host or couldn't get cluster info, try another approach
+  if command -v pvesh &>/dev/null; then
+    # Use pvesh to get node list
+    log_info "Using pvesh to discover Proxmox cluster nodes..."
+    local nodes_json=$(pvesh get /nodes --output-format json 2>/dev/null)
+    
+    if [[ -n "$nodes_json" ]]; then
+      # Extract node names
+      local hosts=$(echo "$nodes_json" | grep -o '"node":"[^"]*"' | cut -d':' -f2 | tr -d '"' | sort | uniq)
+      
+      if [[ -n "$hosts" ]]; then
+        readarray -t PROXMOX_HOSTS <<< "$hosts"
+        log_info "Discovered Proxmox hosts using pvesh: ${PROXMOX_HOSTS[*]}"
+        
+        # Try to get storage info
+        discover_proxmox_storage
+        
+        # Try to discover templates
+        discover_proxmox_templates
         return 0
       fi
     fi
@@ -355,6 +420,9 @@ function discover_proxmox_hosts() {
     
     # Try to get storage info
     discover_proxmox_storage
+    
+    # Try to discover templates
+    discover_proxmox_templates
     return 0
   fi
   
@@ -381,11 +449,140 @@ function discover_proxmox_hosts() {
         fi
       fi
     done
-    
+
     # Try to get storage info
     discover_proxmox_storage
+    
+    # Try to discover templates
+    discover_proxmox_templates
   else
     log_warn "No Proxmox hosts specified, skipping Proxmox integration"
+  fi
+  
+  return 0
+}
+
+# Discover Proxmox VM templates
+function discover_proxmox_templates() {
+  log_info "Discovering Proxmox VM templates..."
+  
+  # Initialize template variables
+  TEMPLATE_MASTER_AMD64=""
+  TEMPLATE_WORKER_AMD64=""
+  TEMPLATE_FULL_AMD64=""
+  TEMPLATE_MASTER_ARM64=""
+  TEMPLATE_WORKER_ARM64=""
+  TEMPLATE_FULL_ARM64=""
+  
+  # Try to get templates using pvesh
+  if command -v pvesh &>/dev/null; then
+    local vm_resources=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null)
+    
+    if [[ -n "$vm_resources" ]]; then
+      # Find template VMs
+      local templates=$(echo "$vm_resources" | grep -o '{[^}]*"template":1[^}]*}')
+      
+      if [[ -n "$templates" ]]; then
+        log_info "Found template VMs:"
+        
+        # Process each template
+        while read -r template; do
+          local template_id=$(echo "$template" | grep -o '"vmid":[0-9]*' | cut -d':' -f2)
+          local template_name=$(echo "$template" | grep -o '"name":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+          
+          log_info "  $template_id: $template_name"
+          
+          # Determine architecture (assume amd64 if not specified)
+          local arch="amd64"
+          if [[ "$template_name" == *"arm"* || "$template_name" == *"arm64"* ]]; then
+            arch="arm64"
+          fi
+          
+          # Look for keywords to identify template type
+          if [[ "$template_name" == *"master"* || "$template_name" == *"control"* ]]; then
+            if [[ "$arch" == "amd64" ]]; then
+              TEMPLATE_MASTER_AMD64="$template_id"
+              log_info "  ^ Identified as amd64 master template"
+            else
+              TEMPLATE_MASTER_ARM64="$template_id"
+              log_info "  ^ Identified as arm64 master template"
+            fi
+          elif [[ "$template_name" == *"worker"* || "$template_name" == *"node"* ]]; then
+            if [[ "$arch" == "amd64" ]]; then
+              TEMPLATE_WORKER_AMD64="$template_id"
+              log_info "  ^ Identified as amd64 worker template"
+            else
+              TEMPLATE_WORKER_ARM64="$template_id"
+              log_info "  ^ Identified as arm64 worker template"
+            fi
+          elif [[ "$template_name" == *"full"* || "$template_name" == *"all"* ]]; then
+            if [[ "$arch" == "amd64" ]]; then
+              TEMPLATE_FULL_AMD64="$template_id"
+              log_info "  ^ Identified as amd64 full node template"
+            else
+              TEMPLATE_FULL_ARM64="$template_id"
+              log_info "  ^ Identified as arm64 full node template"
+            fi
+          else
+            # Default assignment if no specific match
+            if [[ "$arch" == "amd64" ]]; then
+              if [[ -z "$TEMPLATE_FULL_AMD64" ]]; then
+                TEMPLATE_FULL_AMD64="$template_id"
+                log_info "  ^ Using as default amd64 template"
+              fi
+            else
+              if [[ -z "$TEMPLATE_FULL_ARM64" ]]; then
+                TEMPLATE_FULL_ARM64="$template_id"
+                log_info "  ^ Using as default arm64 template"
+              fi
+            fi
+          fi
+        done <<< "$templates"
+      else
+        log_warn "No template VMs found in Proxmox"
+      fi
+    fi
+  fi
+  
+  # If no templates found automatically, use fallbacks
+  # For amd64
+  if [[ -z "$TEMPLATE_FULL_AMD64" ]]; then
+    if [[ -n "$TEMPLATE_MASTER_AMD64" ]]; then
+      TEMPLATE_FULL_AMD64="$TEMPLATE_MASTER_AMD64"
+    elif [[ -n "$TEMPLATE_WORKER_AMD64" ]]; then
+      TEMPLATE_FULL_AMD64="$TEMPLATE_WORKER_AMD64"
+    else
+      read -p "Enter template VM ID for amd64 nodes: " TEMPLATE_FULL_AMD64
+      TEMPLATE_FULL_AMD64="${TEMPLATE_FULL_AMD64:-9000}"  # Default if nothing entered
+    fi
+  fi
+  
+  # Use full template as fallback for specific templates if not found
+  TEMPLATE_MASTER_AMD64="${TEMPLATE_MASTER_AMD64:-$TEMPLATE_FULL_AMD64}"
+  TEMPLATE_WORKER_AMD64="${TEMPLATE_WORKER_AMD64:-$TEMPLATE_FULL_AMD64}"
+  
+  # For arm64
+  if [[ -z "$TEMPLATE_FULL_ARM64" ]]; then
+    if [[ -n "$TEMPLATE_MASTER_ARM64" ]]; then
+      TEMPLATE_FULL_ARM64="$TEMPLATE_MASTER_ARM64"
+    elif [[ -n "$TEMPLATE_WORKER_ARM64" ]]; then
+      TEMPLATE_FULL_ARM64="$TEMPLATE_WORKER_ARM64"
+    else
+      read -p "Enter template VM ID for arm64 nodes (leave empty to skip): " TEMPLATE_FULL_ARM64
+      TEMPLATE_FULL_ARM64="${TEMPLATE_FULL_ARM64:-}"  # No default for arm64
+    fi
+  fi
+  
+  # Use full template as fallback for specific templates if not found
+  if [[ -n "$TEMPLATE_FULL_ARM64" ]]; then
+    TEMPLATE_MASTER_ARM64="${TEMPLATE_MASTER_ARM64:-$TEMPLATE_FULL_ARM64}"
+    TEMPLATE_WORKER_ARM64="${TEMPLATE_WORKER_ARM64:-$TEMPLATE_FULL_ARM64}"
+  fi
+  
+  log_info "Using template IDs:"
+  log_info "  AMD64: Full=$TEMPLATE_FULL_AMD64, Master=$TEMPLATE_MASTER_AMD64, Worker=$TEMPLATE_WORKER_AMD64"
+  if [[ -n "$TEMPLATE_FULL_ARM64" ]]; then
+    log_info "  ARM64: Full=$TEMPLATE_FULL_ARM64, Master=$TEMPLATE_MASTER_ARM64, Worker=$TEMPLATE_WORKER_ARM64"
   fi
   
   return 0
@@ -400,7 +597,16 @@ function discover_proxmox_storage() {
     local storage_output=$(pvesm status 2>/dev/null)
     
     if [[ -n "$storage_output" ]]; then
-      # Look for cephfs storage
+      # First look for specific k3s cephfs storage
+      local k3s_storage=$(echo "$storage_output" | grep -E "cephfs.*k3s" | awk '{print $1}' | head -1)
+      
+      if [[ -n "$k3s_storage" ]]; then
+        PROXMOX_STORAGE="$k3s_storage"
+        log_info "Discovered k3s-specific CephFS storage: $PROXMOX_STORAGE"
+        return 0
+      fi
+      
+      # If no k3s-specific storage, look for any cephfs storage
       local cephfs_storage=$(echo "$storage_output" | grep "cephfs" | awk '{print $1}' | head -1)
       
       if [[ -n "$cephfs_storage" ]]; then
@@ -427,7 +633,16 @@ function discover_proxmox_storage() {
       local storage_output=$(ssh -p "$SSH_PORT" root@$host "pvesm status" 2>/dev/null)
       
       if [[ -n "$storage_output" ]]; then
-        # Look for cephfs storage
+        # First look for specific k3s cephfs storage
+        local k3s_storage=$(echo "$storage_output" | grep -E "cephfs.*k3s" | awk '{print $1}' | head -1)
+        
+        if [[ -n "$k3s_storage" ]]; then
+          PROXMOX_STORAGE="$k3s_storage"
+          log_info "Discovered k3s-specific CephFS storage: $PROXMOX_STORAGE"
+          return 0
+        fi
+        
+        # If no k3s-specific storage, look for any cephfs storage
         local cephfs_storage=$(echo "$storage_output" | grep "cephfs" | awk '{print $1}' | head -1)
         
         if [[ -n "$cephfs_storage" ]]; then
@@ -451,7 +666,7 @@ function discover_proxmox_storage() {
   # If still no storage found, ask user
   if [[ -z "$PROXMOX_STORAGE" ]]; then
     log_warn "Could not discover Proxmox storage"
-    read -p "Enter Proxmox storage name for backups and VMs: " PROXMOX_STORAGE
+    read -p "Enter Proxmox storage name for k3s storage (cephfs preferred): " PROXMOX_STORAGE
     if [[ -n "$PROXMOX_STORAGE" ]]; then
       log_info "Using storage: $PROXMOX_STORAGE"
     fi
@@ -513,6 +728,7 @@ EOF
     local role="worker"
     local vmid=""
     local proxmox_host=""
+    local arch="amd64"  # Default to amd64 if not found
     
     for part in "${detail_parts[@]}"; do
       key="${part%%=*}"
@@ -523,6 +739,7 @@ EOF
         role) role="$value" ;;
         proxmox_vmid) vmid="$value" ;;
         proxmox_host) proxmox_host="$value" ;;
+        arch) arch="$value" ;;
       esac
     done
     
@@ -532,6 +749,7 @@ EOF
     proxmox_vmid: $vmid
     proxmox_host: $proxmox_host
     role: $role
+    arch: $arch
 EOF
   done
   
@@ -569,8 +787,23 @@ EOF
   user: root
   storage: $PROXMOX_STORAGE
   templates:
-    master: 9000  # Template VM ID for master node (placeholder)
-    worker: 9001  # Template VM ID for worker node (placeholder)
+    # AMD64 templates
+    master_amd64: $TEMPLATE_MASTER_AMD64  # Template VM ID for amd64 master node
+    worker_amd64: $TEMPLATE_WORKER_AMD64  # Template VM ID for amd64 worker node
+    full_amd64: $TEMPLATE_FULL_AMD64      # Template VM ID for amd64 full node
+EOF
+
+  # Only add ARM64 templates if we have them
+  if [[ -n "$TEMPLATE_FULL_ARM64" ]]; then
+    cat >> "$output_file" <<EOF
+    # ARM64 templates
+    master_arm64: $TEMPLATE_MASTER_ARM64  # Template VM ID for arm64 master node
+    worker_arm64: $TEMPLATE_WORKER_ARM64  # Template VM ID for arm64 worker node
+    full_arm64: $TEMPLATE_FULL_ARM64      # Template VM ID for arm64 full node
+EOF
+  fi
+
+  cat >> "$output_file" <<EOF
 
 # Backup settings
 backup:
@@ -798,6 +1031,12 @@ function generate_sample_config() {
   # Step 7: Discover Proxmox hosts if needed
   log_info "Discovering Proxmox hosts..."
   discover_proxmox_hosts
+
+  # Now that we have hosts, discover templates if not already discovered
+  if [[ -z "$TEMPLATE_MASTER_AMD64" ]]; then
+    log_info "Discovering VM templates..."
+    discover_proxmox_templates
+  fi
 
   # Re-attempt discovery of VM details if we found hosts but not VM details
   if [[ ${#PROXMOX_HOSTS[@]} -gt 0 ]]; then
