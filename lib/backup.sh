@@ -6,10 +6,6 @@
 # - Taking etcd snapshots
 # - Creating Proxmox VM snapshots
 # - Managing backup retention
-#
-# Author: S-tor + claude.ai
-# Date: February 2025
-# Version: 0.1.0
 
 # Create etcd snapshot
 function create_etcd_snapshot() {

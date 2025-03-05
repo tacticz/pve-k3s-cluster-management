@@ -8,10 +8,6 @@
 # - Node replacement
 #
 # Usage: ./k3s-cluster-admin.sh [options] <command>
-#
-# Author: S-tor + claude.ai
-# Date: February 2025
-# Version: 0.1.0
 
 set -eo pipefail
 
@@ -19,6 +15,7 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Load modules
+source "${SCRIPT_DIR}/lib/version.sh"
 source "${SCRIPT_DIR}/lib/utils.sh"
 source "${SCRIPT_DIR}/lib/config.sh"
 source "${SCRIPT_DIR}/lib/validation.sh"
@@ -27,7 +24,7 @@ source "${SCRIPT_DIR}/lib/backup.sh"
 source "${SCRIPT_DIR}/lib/restore.sh"
 
 # Default configuration values
-DEFAULT_CONFIG_FILE="${SCRIPT_DIR}/conf/cluster-config.yaml"
+DEFAULT_CONFIG_FILE="${SCRIPT_DIR}/config.yaml"
 DEFAULT_RETENTION_COUNT=5
 DEFAULT_DRAINING_TIMEOUT=300  # 5 minutes
 DEFAULT_OPERATION_TIMEOUT=600 # 10 minutes
@@ -47,6 +44,7 @@ Commands:
   snapshot       Create a snapshot of the entire cluster
   replace        Replace a node in the cluster
   validate       Validate cluster health
+  version        Display script version information
   help           Show this help message
 
 Options:
@@ -132,11 +130,25 @@ function parse_args() {
   DRY_RUN="${DRY_RUN:-false}"
 }
 
+function cmd_version() {
+  cat <<EOF
+K3s Cluster Admin Script
+Version: ${VERSION}
+Build Date: ${BUILD_DATE}
+Author: ${AUTHOR}
+
+For more details, see the documentation.
+EOF
+}
+
 function main() {
   parse_args "$@"
 
   # Set command to help if none provided
   COMMAND="${COMMAND:-help}"
+
+  # Display version info
+  log_info "K3s Cluster Admin Script v${VERSION} starting..."
 
   # Load configuration
   if [[ -f "$CONFIG_FILE" ]]; then
@@ -180,6 +192,9 @@ function main() {
       ;;
     replace)
       replace_node
+      ;;
+    version)
+      cmd_version
       ;;
     *)
       log_error "Unknown command: $COMMAND"

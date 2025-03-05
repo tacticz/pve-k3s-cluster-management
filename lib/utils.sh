@@ -3,10 +3,6 @@
 #
 # This module is part of the k3s-cluster-management
 # It provides common utility functions used throughout the script.
-#
-# Author: S-tor + claude.ai
-# Date: February 2025
-# Version: 0.1.1
 
 # Log levels
 LOG_ERROR=1
@@ -180,9 +176,10 @@ function run_interactive_mode() {
   echo "6. Replace node"
   echo "7. Restore cluster"
   echo "8. Generate sample config"
-  echo "9. Exit"
+  echo "9. Display version info"
+  echo "0. Exit"
   
-  read -p "Select an option (1-9): " option
+  read -p "Select an option (0-9): " option
   
   case "$option" in
     1)
@@ -369,6 +366,11 @@ function run_interactive_mode() {
       ;;
 
     9)
+      # Display version information
+      cmd_version
+      ;;
+
+    0)
       log_info "Exiting interactive mode"
       return 0
       ;;

@@ -6,10 +6,6 @@
 # - Restoring from etcd snapshots
 # - Restoring from VM backups/snapshots
 # - Coordinating multi-node restores
-#
-# Author: S-tor + claude.ai
-# Date: February 2025
-# Version: 0.1.0
 
 # Restore etcd from snapshot
 function restore_etcd() {

@@ -4,10 +4,6 @@
 # This module is part of the k3s-cluster-management
 # It handles loading and processing configuration from YAML files,
 # command-line arguments, and default values.
-#
-# Author: S-tor + claude.ai
-# Date: February 2025
-# Version: 0.1.1
 
 # Global variables for discovery
 declare -a NODES

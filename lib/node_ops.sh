@@ -6,10 +6,6 @@
 # - Cordoning and draining
 # - Shutting down nodes
 # - Adding/removing nodes from the cluster
-#
-# Author: S-tor + claude.ai
-# Date: February 2025
-# Version: 0.1.0
 
 # Get all nodes in the cluster
 function get_all_cluster_nodes() {

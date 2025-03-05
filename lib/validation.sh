@@ -4,10 +4,6 @@
 # This module is part of the k3s-cluster-management
 # It provides functions for validating the health and accessibility
 # of the k3s cluster and related components.
-#
-# Author: S-tor + claude.ai
-# Date: February 2025
-# Version: 0.1.0
 
 # Validate cluster health
 function validate_cluster() {
