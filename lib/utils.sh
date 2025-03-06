@@ -162,6 +162,46 @@ function check_required_commands() {
   return 0
 }
 
+# SSH wrapper - errors shown
+function ssh_cmd() {
+  local target="$1"
+  local cmd="$2"
+  local user="${3:-root}"
+  
+  ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd"
+  return $?
+}
+
+# SSH wrapper - all output suppressed (both stdout and stderr)
+function ssh_cmd_silent() {
+  local target="$1"
+  local cmd="$2"
+  local user="${3:-root}"
+  
+  ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd" &>/dev/null
+  return $?
+}
+
+# SSH wrapper - errors suppressed
+function ssh_cmd_quiet() {
+  local target="$1"
+  local cmd="$2"
+  local user="${3:-root}"
+  
+  ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd" 2>/dev/null
+  return $?
+}
+
+# SSH wrapper - errors captured with output
+function ssh_cmd_capture() {
+  local target="$1"
+  local cmd="$2"
+  local user="${3:-root}"
+  
+  ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd" 2>&1
+  return $?
+}
+
 # Run in interactive mode
 function run_interactive_mode() {
   log_section "Interactive Mode"

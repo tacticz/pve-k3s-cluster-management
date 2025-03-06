@@ -57,7 +57,7 @@ function check_k3s_version() {
     log_info "Checking version on $node..."
     
     # Get K3s version
-    local version=$(ssh root@$node "k3s --version 2>/dev/null || echo 'Not installed'")
+    local version=$(ssh_cmd "$node" "k3s --version 2>/dev/null || echo 'Not installed'" "$PROXMOX_USER")
     
     if [[ "$version" == "Not installed" ]]; then
       log_error "K3s not installed on $node"
@@ -91,7 +91,7 @@ function check_nodes_status() {
   local first_node="${NODES[0]}"
   
   # Get node status
-  local nodes_status=$(ssh root@$first_node "kubectl get nodes -o wide" 2>/dev/null)
+  local nodes_status=$(ssh_cmd_quiet "$first_node" "kubectl get nodes -o wide" "$PROXMOX_USER")
   
   if [[ $? -ne 0 ]]; then
     log_error "Failed to get node status from $first_node"
@@ -119,7 +119,7 @@ function check_cluster_health() {
   local first_node="${NODES[0]}"
   
   # Get components status
-  local components_status=$(ssh root@$first_node "kubectl get componentstatuses" 2>/dev/null)
+  local components_status=$(ssh_cmd_quiet "$first_node" "kubectl get componentstatuses" "$PROXMOX_USER")
   
   if [[ $? -ne 0 ]]; then
     log_warn "Failed to get component status (this might be expected with newer Kubernetes versions)"
@@ -134,7 +134,7 @@ function check_cluster_health() {
   fi
   
   # Check for pending pods
-  local pending_pods=$(ssh root@$first_node "kubectl get pods --all-namespaces | grep -v Running | grep -v Completed" 2>/dev/null)
+  local pending_pods=$(ssh_cmd_quiet "$first_node" "kubectl get pods --all-namespaces | grep -v Running | grep -v Completed" "$PROXMOX_USER")
   
   if [[ -n "$pending_pods" ]]; then
     log_warn "Some pods are not in Running/Completed state:"
@@ -159,7 +159,7 @@ function check_etcd_health() {
   local first_node="${NODES[0]}"
   
   # Get etcd status
-  local etcd_health=$(ssh root@$first_node "k3s etcd-snapshot ls 2>/dev/null || echo 'Not available'")
+  local etcd_health=$(ssh_cmd "$first_node" "k3s etcd-snapshot ls 2>/dev/null || echo 'Not available'" "$PROXMOX_USER")
   
   if [[ "$etcd_health" == "Not available" ]]; then
     log_warn "Could not check etcd snapshots, might not be using etcd"
@@ -170,13 +170,13 @@ function check_etcd_health() {
   echo "$etcd_health"
   
   # Check etcd endpoints
-  local etcd_endpoints=$(ssh root@$first_node "kubectl get endpoints -n kube-system etcd-server-events -o yaml" 2>/dev/null)
+  local etcd_endpoints=$(ssh_cmd_quiet "$first_node" "kubectl get endpoints -n kube-system etcd-server-events -o yaml" "$PROXMOX_USER")
   
   if [[ $? -ne 0 ]]; then
     log_warn "Could not get etcd endpoints, checking k3s server service"
     
     # Check if k3s server is running
-    local k3s_status=$(ssh root@$first_node "systemctl status k3s.service | grep Active:" 2>/dev/null)
+    local k3s_status=$(ssh_cmd_quiet "$first_node" "systemctl status k3s.service | grep Active:" "$PROXMOX_USER")
     
     if [[ $? -ne 0 ]] || ! echo "$k3s_status" | grep -q "active (running)"; then
       log_error "k3s server service is not running properly on $first_node"
@@ -204,7 +204,7 @@ function check_storage_health() {
   local first_node="${NODES[0]}"
   
   # Check if CephFS is mounted
-  local mount_check=$(ssh root@$first_node "mount | grep pvecephfs-1-k3s" 2>/dev/null)
+  local mount_check=$(ssh_cmd_quiet "$first_node" "mount | grep pvecephfs-1-k3s" "$PROXMOX_USER")
   
   if [[ -z "$mount_check" ]]; then
     log_error "CephFS not mounted on $first_node"
@@ -215,7 +215,7 @@ function check_storage_health() {
   echo "$mount_check"
   
   # Check if the mount is writable
-  local write_test=$(ssh root@$first_node "touch /mnt/pvecephfs-1-k3s/k3s-admin-write-test && echo 'OK' || echo 'FAIL'" 2>/dev/null)
+  local write_test=$(ssh_cmd_quiet "$first_node" "touch /mnt/pvecephfs-1-k3s/k3s-admin-write-test && echo 'OK' || echo 'FAIL'" "$PROXMOX_USER")
   
   if [[ "$write_test" != "OK" ]]; then
     log_error "CephFS mount is not writable on $first_node"
@@ -223,12 +223,12 @@ function check_storage_health() {
   fi
   
   # Clean up test file
-  ssh root@$first_node "rm -f /mnt/pvecephfs-1-k3s/k3s-admin-write-test" &>/dev/null
-  
+  ssh_cmd_silent "$first_node" "rm -f /mnt/pvecephfs-1-k3s/k3s-admin-write-test" "root"
+    
   log_success "CephFS is mounted and writable on $first_node"
   
   # Check StorageClass (for PVCs)
-  local storage_classes=$(ssh root@$first_node "kubectl get storageclasses" 2>/dev/null)
+  local storage_classes=$(ssh_cmd_quiet "$first_node" "kubectl get storageclasses" "$PROXMOX_USER")
   
   if [[ $? -ne 0 ]]; then
     log_warn "Could not get StorageClasses"
@@ -255,7 +255,7 @@ function check_network_health() {
     
     for target in "${NODES[@]}"; do
       if [[ "$node" != "$target" ]]; then
-        local ping_test=$(ssh root@$node "ping -c 1 -W 2 $target >/dev/null && echo 'OK' || echo 'FAIL'" 2>/dev/null)
+        local ping_test=$(ssh_cmd_quiet "$node" "ping -c 1 -W 2 $target >/dev/null && echo 'OK' || echo 'FAIL'" "$PROXMOX_USER")
         
         if [[ "$ping_test" != "OK" ]]; then
           log_error "$node cannot ping $target"
@@ -272,7 +272,7 @@ function check_network_health() {
   log_info "Checking pod network connectivity..."
   
   # Check CNI status (Flannel WireGuard)
-  local cni_check=$(ssh root@$first_node "kubectl -n kube-system get pods | grep flannel" 2>/dev/null)
+  local cni_check=$(ssh_cmd_quiet "$first_node" "kubectl -n kube-system get pods | grep flannel" "$PROXMOX_USER")
   
   if [[ -z "$cni_check" ]]; then
     log_warn "Could not find flannel pods"
@@ -299,7 +299,7 @@ function check_workload_health() {
   local first_node="${NODES[0]}"
   
   # Get namespaces
-  local namespaces=$(ssh root@$first_node "kubectl get namespaces -o name | cut -d/ -f2" 2>/dev/null)
+  local namespaces=$(ssh_cmd_quiet "$first_node" "kubectl get namespaces -o name | cut -d/ -f2" "$PROXMOX_USER")
   
   if [[ $? -ne 0 ]]; then
     log_error "Failed to get namespaces"
@@ -311,7 +311,7 @@ function check_workload_health() {
     if [[ "$ns" != "kube-system" && "$ns" != "kube-public" && "$ns" != "kube-node-lease" ]]; then
       log_info "Checking deployments in namespace: $ns"
       
-      local deployments=$(ssh root@$first_node "kubectl -n $ns get deployments" 2>/dev/null)
+      local deployments=$(ssh_cmd_quiet "$first_node" "kubectl -n $ns get deployments" "$PROXMOX_USER")
       
       if [[ -n "$deployments" ]]; then
         echo "$deployments"
@@ -337,7 +337,7 @@ function check_proxmox_connectivity() {
     log_info "Checking connectivity to Proxmox host: $host"
     
     # Check if we can SSH to the Proxmox host
-    local ssh_test=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${PROXMOX_USER}@$host "echo 'OK'" 2>/dev/null || echo "FAIL")
+    local ssh_test=$(ssh_cmd_quiet "$host" "echo 'OK'" "$PROXMOX_USER" || echo "FAIL")
     
     if [[ "$ssh_test" != "OK" ]]; then
       log_error "Cannot SSH to Proxmox host $host"
@@ -345,7 +345,7 @@ function check_proxmox_connectivity() {
     fi
     
     # Check if pvesh command is available (Proxmox CLI)
-    local pvesh_test=$(ssh ${PROXMOX_USER}@$host "command -v pvesh >/dev/null && echo 'OK' || echo 'FAIL'" 2>/dev/null)
+    local pvesh_test=$(ssh_cmd_quiet "$host" "command -v pvesh >/dev/null && echo 'OK' || echo 'FAIL'" "$PROXMOX_USER")
     
     if [[ "$pvesh_test" != "OK" ]]; then
       log_error "pvesh command not available on $host"
@@ -382,7 +382,7 @@ function run_preflight_checks() {
   local first_node="${NODES[0]}"
   log_info "Checking kubectl availability on $first_node..."
   
-  local kubectl_check=$(ssh root@$first_node "command -v kubectl >/dev/null && echo 'OK' || echo 'FAIL'" 2>/dev/null)
+  local kubectl_check=$(ssh_cmd_quiet "$first_node" "command -v kubectl >/dev/null && echo 'OK' || echo 'FAIL'" "$PROXMOX_USER")
   
   if [[ "$kubectl_check" != "OK" ]]; then
     log_error "kubectl not available on $first_node"

@@ -183,11 +183,10 @@ function discover_node_proxmox_details() {
 # Detect node architecture
 function detect_node_architecture() {
   local node="$1"
-  local port="${2:-$SSH_PORT}"
   
   if verify_ssh_access "$node" "$port"; then
     # Try to get architecture using uname
-    local arch=$(ssh -p "$port" root@$node "uname -m" 2>/dev/null)
+    local arch=$(ssh_cmd_quiet "$node" "uname -m" "root")
     
     # Map architecture to amd64 or arm64
     case "$arch" in
@@ -216,7 +215,7 @@ function discover_cluster_nodes() {
   
   # Get nodes using kubectl
   log_info "Getting nodes via kubectl from $control_node..."
-  local node_list=$(ssh -p "$SSH_PORT" root@$control_node "kubectl get nodes -o=jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}'" 2>/dev/null)
+  local node_list=$(ssh_cmd_quiet "$control_node" "kubectl get nodes -o=jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}'" "$PROXMOX_USER")
   
   if [[ -z "$node_list" ]]; then
     log_error "Failed to get nodes from the cluster"
@@ -230,11 +229,11 @@ function discover_cluster_nodes() {
   # Get node details
   for node in "${NODES[@]}"; do
     # Try to get IP address
-    local node_ip=$(ssh -p "$SSH_PORT" root@$control_node "kubectl get node $node -o=jsonpath='{.status.addresses[?(@.type==\"InternalIP\")].address}'" 2>/dev/null)
+    local node_ip=$(ssh_cmd_quiet "$control_node" "kubectl get node $node -o=jsonpath='{.status.addresses[?(@.type==\"InternalIP\")].address}'" "$PROXMOX_USER")
     
     # Get node role (master or worker)
-    local is_master=$(ssh -p "$SSH_PORT" root@$control_node "kubectl get node $node -o=jsonpath='{.metadata.labels.node-role\\.kubernetes\\.io/master}'" 2>/dev/null)
-    local is_controlplane=$(ssh -p "$SSH_PORT" root@$control_node "kubectl get node $node -o=jsonpath='{.metadata.labels.node-role\\.kubernetes\\.io/control-plane}'" 2>/dev/null)
+    local is_master=$(ssh_cmd_quiet "$control_node" "kubectl get node $node -o=jsonpath='{.metadata.labels.node-role\\.kubernetes\\.io/master}'" "$PROXMOX_USER")
+    local is_controlplane=$(ssh_cmd_quiet "$control_node" "kubectl get node $node -o=jsonpath='{.metadata.labels.node-role\\.kubernetes\\.io/control-plane}'" "$PROXMOX_USER")
     
     local role="worker"
     if [[ -n "$is_master" || -n "$is_controlplane" ]]; then
@@ -381,7 +380,7 @@ function discover_proxmox_hosts() {
           # If no specific backup storage was found, look for backup storage in name
           for host in "${PROXMOX_HOSTS[@]}"; do
             if verify_ssh_access "$host" "$SSH_PORT"; then
-              local storage_output=$(ssh -p "$SSH_PORT" root@$host "pvesm status" 2>/dev/null)
+              local storage_output=$(ssh_cmd_quiet "$host" "pvesm status" "$PROXMOX_USER")
               if [[ -n "$storage_output" ]]; then
                 local backup_storage=$(echo "$storage_output" | grep -E "backup" | awk '{print $1}' | head -1)
                 if [[ -n "$backup_storage" ]]; then
@@ -648,7 +647,7 @@ function discover_proxmox_storage() {
   for host in "${PROXMOX_HOSTS[@]}"; do
     if verify_ssh_access "$host" "$SSH_PORT"; then
       log_info "Getting storage information from Proxmox host $host..."
-      local storage_output=$(ssh -p "$SSH_PORT" root@$host "pvesm status" 2>/dev/null)
+      local storage_output=$(ssh_cmd_quiet "$host" "pvesm status" "$PROXMOX_USER")
       
       if [[ -n "$storage_output" ]]; then
         # First look for specific k3s cephfs storage
@@ -717,7 +716,7 @@ function discover_proxmox_storage_details() {
   if [[ -z "$storage_json" ]] && [[ ${#PROXMOX_HOSTS[@]} -gt 0 ]]; then
     for host in "${PROXMOX_HOSTS[@]}"; do
       if verify_ssh_access "$host" "$SSH_PORT"; then
-        storage_json=$(ssh -p "$SSH_PORT" ${PROXMOX_USER}@$host "pvesh get /storage --output-format json" 2>/dev/null)
+        storage_json=$(ssh_cmd_quiet "$host" "pvesh get /storage --output-format json" "$PROXMOX_USER")
         if [[ -n "$storage_json" ]]; then
           break
         fi
@@ -760,7 +759,7 @@ function discover_storage_config() {
   local node="$1"
   
   # Check for CephFS mount
-  local cephfs_mount=$(ssh -p "$SSH_PORT" root@$node "mount | grep cephfs" 2>/dev/null)
+  local cephfs_mount=$(ssh_cmd_quiet "$node" "mount | grep cephfs" "$PROXMOX_USER")
   
   if [[ -n "$cephfs_mount" ]]; then
     local mount_point=$(echo "$cephfs_mount" | awk '{print $3}' | head -1)
@@ -1107,7 +1106,7 @@ function generate_sample_config() {
   fi
   
   # Get API server address
-  api_server=$(ssh -p "$SSH_PORT" root@$control_plane_node "cat /etc/rancher/k3s/k3s.yaml | grep server: | awk '{print \$2}'" 2>/dev/null)
+  api_server=$(ssh_cmd_quiet "$control_plane_node" "cat /etc/rancher/k3s/k3s.yaml | grep server: | awk '{print \$2}'" "$PROXMOX_USER")
   log_info "Detected API server: $api_server"
   
   # Step 6: Attempt to discover Proxmox VM details first if running on a Proxmox host

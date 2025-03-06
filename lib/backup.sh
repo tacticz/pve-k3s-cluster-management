@@ -20,7 +20,7 @@ function create_etcd_snapshot() {
   fi
   
   # Check if node is running k3s server (has etcd)
-  local is_server=$(ssh root@$first_node "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" 2>/dev/null)
+local is_server=$(ssh_cmd_quiet "$first_node" "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" "$PROXMOX_USER")
   
   if [[ "$is_server" != "true" ]]; then
     log_error "Node $first_node is not running k3s server, cannot create etcd snapshot"
@@ -28,7 +28,7 @@ function create_etcd_snapshot() {
     # Try to find another node running server
     for node in "${NODES[@]}"; do
       if [[ "$node" != "$first_node" ]]; then
-        is_server=$(ssh root@$node "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" 2>/dev/null)
+        is_server=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" "$PROXMOX_USER")
         if [[ "$is_server" == "true" ]]; then
           first_node="$node"
           log_info "Using $first_node for etcd snapshot instead"
@@ -44,7 +44,7 @@ function create_etcd_snapshot() {
   fi
   
   # Create etcd snapshot
-  local snapshot_result=$(ssh root@$first_node "k3s etcd-snapshot save --name $snapshot_name" 2>&1)
+  local snapshot_result=$(ssh_cmd_capture "$first_node" "k3s etcd-snapshot save --name $snapshot_name" "$PROXMOX_USER")
   local exit_code=$?
   
   if [[ $exit_code -ne 0 ]]; then
@@ -55,7 +55,7 @@ function create_etcd_snapshot() {
   log_success "Etcd snapshot created successfully: $snapshot_name"
   
   # Get snapshot location
-  local snapshot_location=$(ssh root@$first_node "ls -la /var/lib/rancher/k3s/server/db/snapshots/$snapshot_name* 2>/dev/null | tail -1" 2>/dev/null)
+  local snapshot_location=$(ssh_cmd_quiet "$first_node" "ls -la /var/lib/rancher/k3s/server/db/snapshots/$snapshot_name* 2>/dev/null | tail -1" "$PROXMOX_USER")
   log_info "Snapshot stored at: $snapshot_location"
   
   return 0
@@ -136,7 +136,7 @@ function backup_cluster() {
     backup_cmd="$backup_cmd --description \"K3s cluster backup - Node: $node - Timestamp: $TIMESTAMP - Etcd: $etcd_snapshot_name\""
     
     log_info "Running backup command: $backup_cmd"
-    local backup_result=$(ssh ${PROXMOX_USER}@$proxmox_host "$backup_cmd" 2>&1)
+    local backup_result=$(ssh_cmd_capture "$proxmox_host" "$backup_cmd" "$PROXMOX_USER")
     local exit_code=$?
     
     if [[ $exit_code -ne 0 ]]; then
@@ -222,7 +222,7 @@ function snapshot_cluster() {
     local snapshot_cmd="qm snapshot $vm_id $snapshot_name --description \"$snapshot_desc\""
     
     log_info "Running snapshot command: $snapshot_cmd"
-    local snapshot_result=$(ssh ${PROXMOX_USER}@$proxmox_host "$snapshot_cmd" 2>&1)
+    local snapshot_result=$(ssh_cmd_capture "$proxmox_host" "$snapshot_cmd" "$PROXMOX_USER")
     local exit_code=$?
     
     if [[ $exit_code -ne 0 ]]; then
@@ -269,7 +269,7 @@ function clean_old_backups() {
       fi
       
       # Find backups for this VM
-      local backups=$(ssh ${PROXMOX_USER}@$proxmox_host "find /var/lib/vz/dump -name \"vzdump-qemu-${vm_id}-*.vma*\" -o -name \"vzdump-qemu-${vm_id}-*.tgz*\" | sort -r" 2>/dev/null)
+      local backups=$(ssh_cmd_quiet "$proxmox_host" "find /var/lib/vz/dump -name \"vzdump-qemu-${vm_id}-*.vma*\" -o -name \"vzdump-qemu-${vm_id}-*.tgz*\" | sort -r" "$PROXMOX_USER")
       
       if [[ -z "$backups" ]]; then
         log_info "No backups found for VM $vm_id on $proxmox_host"
@@ -291,7 +291,7 @@ function clean_old_backups() {
       if [[ -n "$to_delete" ]]; then
         log_info "Deleting old backups for VM $vm_id: $to_delete"
         for backup in $to_delete; do
-          ssh ${PROXMOX_USER}@$proxmox_host "rm -f $backup" &>/dev/null
+          ssh_cmd_silent "$proxmox_host" "rm -f $backup" "$PROXMOX_USER"
         done
       else
         log_info "No old backups to delete for VM $vm_id (count: $count, retention: $RETENTION_COUNT)"
@@ -328,7 +328,7 @@ function clean_old_snapshots() {
     log_info "Checking snapshots for VM $vm_id on $proxmox_host..."
     
     # Get list of snapshots for this VM
-    local snapshots=$(ssh ${PROXMOX_USER}@$proxmox_host "qm listsnapshot $vm_id | grep -v current | grep -v Name | awk '{print \$1}' | grep -E '^${BACKUP_PREFIX}-[0-9]{8}-[0-9]{6}\$' | sort -r" 2>/dev/null)
+    local snapshots=$(ssh_cmd_quiet "$proxmox_host" "qm listsnapshot $vm_id | grep -v current | grep -v Name | awk '{print \$1}' | grep -E '^${BACKUP_PREFIX}-[0-9]{8}-[0-9]{6}\$' | sort -r" "$PROXMOX_USER")
     
     if [[ -z "$snapshots" ]]; then
       log_info "No snapshots found for VM $vm_id matching pattern ${BACKUP_PREFIX}-*"
@@ -351,7 +351,7 @@ function clean_old_snapshots() {
       log_info "Deleting old snapshots for VM $vm_id: $to_delete"
       for snapshot in $to_delete; do
         log_info "Deleting snapshot $snapshot..."
-        ssh ${PROXMOX_USER}@$proxmox_host "qm delsnapshot $vm_id $snapshot" &>/dev/null
+        ssh_cmd_silent "$proxmox_host" "qm delsnapshot $vm_id $snapshot" "$PROXMOX_USER"
       done
     else
       log_info "No old snapshots to delete for VM $vm_id (count: $count, retention: $RETENTION_COUNT)"
@@ -369,13 +369,13 @@ function clean_old_etcd_snapshots() {
   local first_node="${NODES[0]}"
   
   # Check if node is running k3s server (has etcd)
-  local is_server=$(ssh root@$first_node "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" 2>/dev/null)
+  local is_server=$(ssh_cmd_quiet "$first_node" "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" "$PROXMOX_USER")
   
   if [[ "$is_server" != "true" ]]; then
     # Try to find another node running server
     for node in "${NODES[@]}"; do
       if [[ "$node" != "$first_node" ]]; then
-        is_server=$(ssh root@$node "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" 2>/dev/null)
+        is_server=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" "$PROXMOX_USER")
         if [[ "$is_server" == "true" ]]; then
           first_node="$node"
           break
@@ -392,7 +392,7 @@ function clean_old_etcd_snapshots() {
   log_info "Cleaning up old etcd snapshots on $first_node..."
   
   # List etcd snapshots
-  local snapshots=$(ssh root@$first_node "ls -1 /var/lib/rancher/k3s/server/db/snapshots/ | grep -E '^${BACKUP_PREFIX}-[0-9]{8}-[0-9]{6}-etcd' | sort -r" 2>/dev/null)
+  local snapshots=$(ssh_cmd_quiet "$first_node" "ls -1 /var/lib/rancher/k3s/server/db/snapshots/ | grep -E '^${BACKUP_PREFIX}-[0-9]{8}-[0-9]{6}-etcd' | sort -r" "$PROXMOX_USER")
   
   if [[ -z "$snapshots" ]]; then
     log_info "No etcd snapshots found matching pattern ${BACKUP_PREFIX}-*-etcd"
@@ -414,7 +414,7 @@ function clean_old_etcd_snapshots() {
   if [[ -n "$to_delete" ]]; then
     log_info "Deleting old etcd snapshots: $to_delete"
     for snapshot in $to_delete; do
-      ssh root@$first_node "rm -f /var/lib/rancher/k3s/server/db/snapshots/$snapshot" &>/dev/null
+      ssh_cmd_silent "$first_node" "rm -f /var/lib/rancher/k3s/server/db/snapshots/$snapshot" "root"
     done
   else
     log_info "No old etcd snapshots to delete (count: $count, retention: $RETENTION_COUNT)"

@@ -24,7 +24,7 @@ function get_all_cluster_nodes() {
       local proxmox_host="${PROXMOX_HOSTS[0]}"
       
       # Try to get VM list with 'k3s' in the name
-      local vms=$(ssh ${PROXMOX_USER}@$proxmox_host "qm list | grep k3s | awk '{print \$2}'" 2>/dev/null)
+      local vms=$(ssh_cmd_quiet "$proxmox_host" "qm list | grep k3s | awk '{print \$2}'" "$PROXMOX_USER")
       
       if [[ -n "$vms" ]]; then
         echo "$vms"
@@ -37,7 +37,7 @@ function get_all_cluster_nodes() {
   fi
   
   # Get nodes from the cluster using kubectl
-  local nodes=$(ssh root@$first_node "kubectl get nodes -o=jsonpath='{.items[*].metadata.name}'" 2>/dev/null)
+  local nodes=$(ssh_cmd_quiet "$first_node" "kubectl get nodes -o=jsonpath='{.items[*].metadata.name}'" "$PROXMOX_USER")
   
   if [[ -z "$nodes" ]]; then
     log_error "Could not get nodes from the cluster"
@@ -74,7 +74,7 @@ function cordon_node() {
     return 0
   fi
   
-  local result=$(ssh root@$kubectl_node "kubectl cordon $node" 2>&1)
+  local result=$(ssh_cmd_capture "$kubectl_node" "kubectl cordon $node" "$PROXMOX_USER")
   local exit_code=$?
   
   if [[ $exit_code -ne 0 ]]; then
@@ -112,7 +112,7 @@ function uncordon_node() {
     return 0
   fi
   
-  local result=$(ssh root@$kubectl_node "kubectl uncordon $node" 2>&1)
+  local result=$(ssh_cmd_capture "$kubectl_node" "kubectl uncordon $node" "$PROXMOX_USER")
   local exit_code=$?
   
   if [[ $exit_code -ne 0 ]]; then
@@ -162,7 +162,7 @@ function drain_node() {
   log_info "This may take some time, timeout set to $DRAINING_TIMEOUT seconds..."
   
   # Run with timeout
-  local result=$(ssh root@$kubectl_node "timeout $DRAINING_TIMEOUT $drain_cmd" 2>&1)
+  local result=$(ssh_cmd_capture "$kubectl_node" "timeout $DRAINING_TIMEOUT $drain_cmd" "$PROXMOX_USER")
   local exit_code=$?
   
   if [[ $exit_code -ne 0 ]]; then
@@ -224,7 +224,7 @@ function shutdown_node() {
     fi
     
     # Check if node is part of control plane
-    local is_control_plane=$(ssh root@$node "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" 2>/dev/null)
+    local is_control_plane=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" "$PROXMOX_USER")
     
     if [[ "$is_control_plane" == "true" ]]; then
       log_info "Node $node is part of the control plane"
@@ -233,7 +233,7 @@ function shutdown_node() {
       local control_plane_count=0
       for n in "${NODES[@]}"; do
         if [[ "$n" != "$node" ]]; then
-          local node_role=$(ssh root@$n "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'control' || echo 'worker'" 2>/dev/null)
+          local node_role=$(ssh_cmd_quiet "$n" "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'control' || echo 'worker'" "$PROXMOX_USER")
           if [[ "$node_role" == "control" ]]; then
             ((control_plane_count++))
           fi
@@ -271,7 +271,7 @@ function shutdown_node() {
     # 3. Stop k3s service on the node
     log_info "Stopping k3s service on $node..."
     if [[ "$DRY_RUN" != "true" ]]; then
-      ssh root@$node "systemctl stop k3s.service k3s-agent.service 2>/dev/null"
+      ssh_cmd "$node" "systemctl stop k3s.service k3s-agent.service 2>/dev/null" "root"
     else
       log_info "[DRY RUN] Would stop k3s service on $node"
     fi
@@ -280,7 +280,7 @@ function shutdown_node() {
     log_info "Shutting down VM $vm_id on $proxmox_host..."
     
     if [[ "$DRY_RUN" != "true" ]]; then
-      local shutdown_result=$(ssh ${PROXMOX_USER}@$proxmox_host "qm shutdown $vm_id --timeout 180" 2>&1)
+      local shutdown_result=$(ssh_cmd_capture "$proxmox_host" "qm shutdown $vm_id --timeout 180" "$PROXMOX_USER")
       local exit_code=$?
       
       if [[ $exit_code -ne 0 ]]; then
@@ -288,7 +288,7 @@ function shutdown_node() {
         
         if [[ "$FORCE" == "true" ]]; then
           log_warn "Force flag set, attempting to stop VM..."
-          ssh ${PROXMOX_USER}@$proxmox_host "qm stop $vm_id" &>/dev/null
+          ssh_cmd_silent "$proxmox_host" "qm stop $vm_id" "$PROXMOX_USER"
         fi
       else
         log_success "VM $vm_id shutdown initiated"
@@ -318,7 +318,7 @@ function start_node() {
   log_info "Starting VM $vm_id on $proxmox_host..."
   
   if [[ "$DRY_RUN" != "true" ]]; then
-    local start_result=$(ssh ${PROXMOX_USER}@$proxmox_host "qm start $vm_id" 2>&1)
+    local start_result=$(ssh_cmd_capture "$proxmox_host" "qm start $vm_id" "$PROXMOX_USER")
     local exit_code=$?
     
     if [[ $exit_code -ne 0 ]]; then
@@ -338,7 +338,7 @@ function start_node() {
         
         # Wait for k3s service to be up
         log_info "Waiting for k3s service to be up..."
-        ssh root@$node "timeout 60 bash -c 'until systemctl is-active k3s.service k3s-agent.service 2>/dev/null; do sleep 5; done'" &>/dev/null
+        ssh_cmd_silent "$node" "timeout 60 bash -c 'until systemctl is-active k3s.service k3s-agent.service 2>/dev/null; do sleep 5; done'" "root"
         
         # Uncordon the node
         uncordon_node "$node"
@@ -409,7 +409,7 @@ function replace_node() {
   log_info "Step 2: Taking backup of VM $vm_id before replacement"
   if [[ "$DRY_RUN" != "true" ]]; then
     local backup_name="prereplace-${node}-${TIMESTAMP}"
-    local backup_result=$(ssh ${PROXMOX_USER}@$proxmox_host "vzdump $vm_id --compress --mode snapshot --storage ${PROXMOX_STORAGE} --tmpdir /tmp --description 'Pre-replacement backup of $node'" 2>&1)
+    local backup_result=$(ssh_cmd_capture "$proxmox_host" "vzdump $vm_id --compress --mode snapshot --storage ${PROXMOX_STORAGE} --tmpdir /tmp --description 'Pre-replacement backup of $node'" "$PROXMOX_USER")
     
     if [[ $? -ne 0 ]]; then
       log_warn "Failed to take backup of VM $vm_id: $backup_result"
@@ -448,7 +448,7 @@ function replace_node() {
   fi
   
   if [[ "$DRY_RUN" != "true" ]]; then
-    local delete_result=$(ssh root@$kubectl_node "kubectl delete node $node" 2>&1)
+    local delete_result=$(ssh_cmd_capture "$kubectl_node" "kubectl delete node $node" "$PROXMOX_USER")
     
     if [[ $? -ne 0 ]]; then
       log_error "Failed to remove node $node from cluster: $delete_result"
@@ -487,11 +487,11 @@ function replace_node() {
     if [[ "$DRY_RUN" != "true" ]]; then
       # Delete old VM
       log_info "Deleting old VM $vm_id"
-      ssh ${PROXMOX_USER}@$proxmox_host "qm destroy $vm_id --purge" &>/dev/null
+      ssh_cmd_silent "$proxmox_host" "qm destroy $vm_id --purge" "$PROXMOX_USER"
       
       # Clone from template
       log_info "Cloning new VM from template $template_id"
-      local clone_result=$(ssh ${PROXMOX_USER}@$proxmox_host "qm clone $template_id $vm_id --name $node" 2>&1)
+      local clone_result=$(ssh_cmd_capture "$proxmox_host" "qm clone $template_id $vm_id --name $node" "$PROXMOX_USER")
       
       if [[ $? -ne 0 ]]; then
         log_error "Failed to clone VM from template: $clone_result"
@@ -502,7 +502,7 @@ function replace_node() {
       log_info "Configuring VM network with IP $node_ip"
       # This part depends on your VM configuration method - cloud-init, custom scripts, etc.
       # Example for cloud-init:
-      ssh ${PROXMOX_USER}@$proxmox_host "qm set $vm_id --ipconfig0 ip=$node_ip/24,gw=10.0.7.1" &>/dev/null
+      ssh_cmd_silent "$proxmox_host" "qm set $vm_id --ipconfig0 ip=$node_ip/24,gw=10.0.7.1" "$PROXMOX_USER"
     else
       log_info "[DRY RUN] Would recreate VM $vm_id from template $template_id with IP $node_ip"
     fi
@@ -512,12 +512,12 @@ function replace_node() {
       log_info "Resetting existing VM $vm_id"
       # This part depends on how you want to reset the VM
       # Example: Roll back to a clean snapshot if available
-      local snapshots=$(ssh ${PROXMOX_USER}@$proxmox_host "qm listsnapshot $vm_id" 2>/dev/null | grep -i clean)
+      local snapshots=$(ssh_cmd_quiet "$proxmox_host" "qm listsnapshot $vm_id" "$PROXMOX_USER" | grep -i clean)
       
       if [[ -n "$snapshots" ]]; then
         local clean_snapshot=$(echo "$snapshots" | head -1 | awk '{print $1}')
         log_info "Rolling back to snapshot $clean_snapshot"
-        ssh ${PROXMOX_USER}@$proxmox_host "qm rollback $vm_id $clean_snapshot" &>/dev/null
+        ssh_cmd_silent "$proxmox_host" "qm rollback $vm_id $clean_snapshot" "$PROXMOX_USER"
       else
         log_warn "No clean snapshot found for VM $vm_id, just restarting"
       fi
@@ -529,7 +529,7 @@ function replace_node() {
   # Step 5: Start the VM
   log_info "Step 5: Starting the VM"
   if [[ "$DRY_RUN" != "true" ]]; then
-    ssh ${PROXMOX_USER}@$proxmox_host "qm start $vm_id" &>/dev/null
+    ssh_cmd_silent "$proxmox_host" "qm start $vm_id" "$PROXMOX_USER"
     
     # Wait for the node to be reachable
     log_info "Waiting for $node to be reachable..."
@@ -559,7 +559,7 @@ function replace_node() {
   
   if [[ "$DRY_RUN" != "true" ]]; then
     # Get cluster token
-    local token=$(ssh root@$kubectl_node "cat /var/lib/rancher/k3s/server/node-token" 2>/dev/null)
+    local token=$(ssh_cmd_quiet "$kubectl_node" "cat /var/lib/rancher/k3s/server/node-token" "$PROXMOX_USER")
     
     if [[ -z "$token" ]]; then
       log_error "Could not retrieve cluster token from $kubectl_node"
@@ -570,11 +570,11 @@ function replace_node() {
     if [[ "$node_role" == "master" || "$node_role" == "control" ]]; then
       log_info "Installing k3s server on $node"
       local install_cmd="curl -sfL https://get.k3s.io | sh -s - server --server https://${kubectl_node}:6443 --token ${token} --tls-san ${node_ip} --flannel-backend=wireguard-native --node-label=\"kubernetes.io/arch=amd64\""
-      ssh root@$node "$install_cmd" &>/dev/null
+      ssh_cmd_silent "$node" "$install_cmd" "root"
     else
       log_info "Installing k3s agent on $node"
       local install_cmd="curl -sfL https://get.k3s.io | sh -s - agent --server https://${kubectl_node}:6443 --token ${token} --node-label=\"kubernetes.io/arch=amd64\""
-      ssh root@$node "$install_cmd" &>/dev/null
+      ssh_cmd_silent "$node" "$install_cmd" "root"
     fi
     
     # Wait for the node to join the cluster
@@ -582,7 +582,7 @@ function replace_node() {
     local timeout=300
     local count=0
     while [[ $count -lt $timeout ]]; do
-      local node_status=$(ssh root@$kubectl_node "kubectl get node $node -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'" 2>/dev/null)
+      local node_status=$(ssh_cmd_quiet "$kubectl_node" "kubectl get node $node -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'" "$PROXMOX_USER")
       
       if [[ "$node_status" == "True" ]]; then
         log_success "Node $node has joined the cluster and is Ready"
@@ -607,52 +607,52 @@ function replace_node() {
   
   if [[ "$DRY_RUN" != "true" ]]; then
     # Install required packages
-    ssh root@$node "apt update && apt install -y ceph-common ceph-fuse" &>/dev/null
+    ssh_cmd_silent "$node" "apt update && apt install -y ceph-common ceph-fuse" "root"
     
     # Create Ceph config
-    ssh root@$node "mkdir -p /etc/ceph" &>/dev/null
+    ssh_cmd_silent "$node" "mkdir -p /etc/ceph" "root"
     
     # Get Ceph key from an existing node
-    local ceph_key=$(ssh root@$kubectl_node "cat /etc/ceph/ceph.keyring" 2>/dev/null)
+    local ceph_key=$(ssh_cmd_quiet "$kubectl_node" "cat /etc/ceph/ceph.keyring" "$PROXMOX_USER")
     
     if [[ -z "$ceph_key" ]]; then
       log_warn "Could not retrieve Ceph keyring from $kubectl_node"
     else
-      ssh root@$node "cat > /etc/ceph/ceph.keyring << 'EOF'
+      ssh_cmd "$node" "cat > /etc/ceph/ceph.keyring << 'EOF'
 $ceph_key
 EOF
 chmod 600 /etc/ceph/ceph.keyring" &>/dev/null
     fi
     
     # Get Ceph config
-    local ceph_conf=$(ssh root@$kubectl_node "cat /etc/ceph/ceph.conf" 2>/dev/null)
+    local ceph_conf=$(ssh_cmd_quiet "$kubectl_node" "cat /etc/ceph/ceph.conf" "$PROXMOX_USER")
     
     if [[ -z "$ceph_conf" ]]; then
       log_warn "Could not retrieve Ceph config from $kubectl_node"
     else
-      ssh root@$node "cat > /etc/ceph/ceph.conf << 'EOF'
+      ssh_cmd "$node" "cat > /etc/ceph/ceph.conf << 'EOF'
 $ceph_conf
 EOF" &>/dev/null
     fi
     
     # Create mount point and update fstab
-    ssh root@$node "mkdir -p /mnt/pvecephfs-1-k3s" &>/dev/null
+    ssh_cmd_silent "$node" "mkdir -p /mnt/pvecephfs-1-k3s" "root"
     
     # Check if fstab entry already exists
-    local fstab_check=$(ssh root@$node "grep pvecephfs-1-k3s /etc/fstab" 2>/dev/null)
+    local fstab_check=$(ssh_cmd_quiet "$node" "grep pvecephfs-1-k3s /etc/fstab" "$PROXMOX_USER")
     
     if [[ -z "$fstab_check" ]]; then
-      ssh root@$node "cat >> /etc/fstab << 'EOF'
+      ssh_cmd "$node" "cat >> /etc/fstab << 'EOF'
 # Mount cluster shared cephfs
 none /mnt/pvecephfs-1-k3s fuse.ceph ceph.id=admin,ceph.client_fs=pvecephfs-1-k3s,_netdev,defaults 0 0
 EOF" &>/dev/null
     fi
     
     # Mount CephFS
-    ssh root@$node "mount /mnt/pvecephfs-1-k3s" &>/dev/null
+    ssh_cmd_silent "$node" "mount /mnt/pvecephfs-1-k3s" "root"
     
     # Verify mount
-    local mount_check=$(ssh root@$node "mount | grep pvecephfs-1-k3s" 2>/dev/null)
+    local mount_check=$(ssh_cmd_quiet "$node" "mount | grep pvecephfs-1-k3s" "$PROXMOX_USER")
     
     if [[ -z "$mount_check" ]]; then
       log_warn "CephFS mount not verified on $node"
