@@ -219,6 +219,17 @@ function snapshot_cluster() {
     log_warn "Continuing snapshot creation despite validation failure due to --force flag"
   }
   
+  # Asking about snapshotting the entire cluster is handled in run_interactive_mode
+  local snapshot_all_nodes=true
+  
+  # In non-interactive mode, or if called from run_interactive_mode after node selection
+  # we should just proceed with whatever NODES contains
+  if [[ "$INTERACTIVE" == "true" && -z "$1" ]]; then
+    # Only if directly called in interactive mode and no argument provided
+    # (we'll use $1 as a flag to indicate we've been called from run_interactive_mode)
+    original_nodes=("${NODES[@]}")
+  fi
+  
   # Ask for snapshot name or use default
   local snapshot_specific_name="auto"
   local custom_description=""
@@ -294,7 +305,9 @@ function snapshot_cluster() {
   log_info "Then processing master nodes: ${master_nodes[*]}"
   
   # Save original nodes array
-  original_nodes=("${NODES[@]}")
+  if [[ "$snapshot_all_nodes" == "true" ]]; then
+    original_nodes=("${NODES[@]}")
+  fi
   
   # Process worker nodes first
   if [[ ${#worker_nodes[@]} -gt 0 ]]; then

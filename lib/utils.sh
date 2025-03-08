@@ -381,7 +381,8 @@ function run_interactive_mode() {
     
     5)
       # Interactive snapshot
-      if confirm "Create snapshot of the entire cluster?"; then
+      if confirm "Create snapshot of the entire cluster?" "y"; then
+        # All nodes will be snapshotted
         read -p "Enter retention count (leave empty for default: $DEFAULT_RETENTION_COUNT): " retention
         
         if [[ -n "$retention" ]]; then
@@ -390,8 +391,59 @@ function run_interactive_mode() {
         
         snapshot_cluster
       else
-        log_info "Snapshot creation cancelled"
-        return 0
+        # Select specific nodes to snapshot
+        echo "Available nodes:"
+        for i in "${!NODES[@]}"; do
+          echo "$((i+1)). ${NODES[$i]}"
+        done
+        
+        # Get node selection
+        local original_nodes=("${NODES[@]}")
+        local selected_indices=()
+        read -p "Enter node numbers to snapshot (comma-separated, e.g., 1,3,4): " node_selection
+        
+        # Parse selection
+        IFS=',' read -ra selected_items <<< "$node_selection"
+        for item in "${selected_items[@]}"; do
+          # Trim any whitespace
+          item=$(echo "$item" | tr -d '[:space:]')
+          if [[ "$item" =~ ^[0-9]+$ && "$item" -ge 1 && "$item" -le "${#NODES[@]}" ]]; then
+            selected_indices+=($((item-1)))
+          else
+            log_warn "Invalid selection: $item, ignoring"
+          fi
+        done
+        
+        if [[ ${#selected_indices[@]} -eq 0 ]]; then
+          log_error "No valid nodes selected"
+          return 1
+        fi
+        
+        # Create new nodes array with only selected nodes
+        local selected_nodes=()
+        for idx in "${selected_indices[@]}"; do
+          selected_nodes+=("${NODES[$idx]}")
+        done
+        
+        # Replace NODES array with selected nodes
+        NODES=("${selected_nodes[@]}")
+        log_info "Selected nodes for snapshot: ${NODES[*]}"
+        
+        read -p "Enter retention count (leave empty for default: $DEFAULT_RETENTION_COUNT): " retention
+        
+        if [[ -n "$retention" ]]; then
+          RETENTION_COUNT="$retention"
+        fi
+        
+        # Capture the return value of snapshot_cluster
+        snapshot_cluster
+        local snapshot_result=$?
+        
+        # Restore original nodes array
+        NODES=("${original_nodes[@]}")
+        
+        # Return the result of snapshot_cluster
+        return $snapshot_result
       fi
       ;;
     
