@@ -54,8 +54,10 @@ function cordon_node() {
   
   log_info "Cordoning node $node..."
   
-  # Use any node that's not the target to run kubectl
+  # Find a kubectl node that's not the target
   local kubectl_node=""
+  
+  # First try nodes in the current NODES array
   for n in "${NODES[@]}"; do
     if [[ "$n" != "$node" ]]; then
       kubectl_node="$n"
@@ -63,9 +65,27 @@ function cordon_node() {
     fi
   done
   
+  # If no node found in NODES array, try to get a node from the config
   if [[ -z "$kubectl_node" ]]; then
-    # If only one node, use it
-    kubectl_node="${NODES[0]}"
+    # Get all nodes from config
+    local all_nodes=$(yq -r '.nodes[]' "$CONFIG_FILE" 2>/dev/null)
+    
+    # Find a node that's not the target and is accessible
+    for potential_node in $all_nodes; do
+      if [[ "$potential_node" != "$node" ]]; then
+        if ssh_cmd_quiet "$potential_node" "echo Connected" "$PROXMOX_USER" &>/dev/null; then
+          kubectl_node="$potential_node"
+          log_info "Using $kubectl_node to run kubectl commands"
+          break
+        fi
+      fi
+    done
+  fi
+  
+  # If still no other node found, use the node itself as last resort
+  if [[ -z "$kubectl_node" ]]; then
+    kubectl_node="$node"
+    log_warn "No other accessible node found, using $node itself for cordoning"
   fi
   
   # Execute cordon command
@@ -92,8 +112,10 @@ function uncordon_node() {
   
   log_info "Uncordoning node $node..."
   
-  # Use any node that's not the target to run kubectl
+  # Find a kubectl node that's not the target
   local kubectl_node=""
+  
+  # First try nodes in the current NODES array
   for n in "${NODES[@]}"; do
     if [[ "$n" != "$node" ]]; then
       kubectl_node="$n"
@@ -101,9 +123,27 @@ function uncordon_node() {
     fi
   done
   
+  # If no node found in NODES array, try to get a node from the config
   if [[ -z "$kubectl_node" ]]; then
-    # If only one node, use it
-    kubectl_node="${NODES[0]}"
+    # Get all nodes from config
+    local all_nodes=$(yq -r '.nodes[]' "$CONFIG_FILE" 2>/dev/null)
+    
+    # Find a node that's not the target and is accessible
+    for potential_node in $all_nodes; do
+      if [[ "$potential_node" != "$node" ]]; then
+        if ssh_cmd_quiet "$potential_node" "echo Connected" "$PROXMOX_USER" &>/dev/null; then
+          kubectl_node="$potential_node"
+          log_info "Using $kubectl_node to run kubectl commands"
+          break
+        fi
+      fi
+    done
+  fi
+  
+  # If still no other node found, use the node itself as last resort
+  if [[ -z "$kubectl_node" ]]; then
+    kubectl_node="$node"
+    log_warn "No other accessible node found, using $node itself for uncordoning"
   fi
   
   # Execute uncordon command
@@ -131,7 +171,7 @@ function drain_node() {
   
   log_info "Draining node $node..."
   
-  # Use any node that's not the target to run kubectl
+  # First try to use another node from the current NODES array
   local kubectl_node=""
   for n in "${NODES[@]}"; do
     if [[ "$n" != "$node" ]]; then
@@ -140,8 +180,28 @@ function drain_node() {
     fi
   done
   
+  # If no node found in NODES array, try to get a control plane node from the cluster
   if [[ -z "$kubectl_node" ]]; then
-    log_error "Need at least one other node to drain $node"
+    log_info "Looking for another control plane node to run kubectl from..."
+    
+    # Get all nodes from config
+    local all_nodes=$(yq -r '.nodes[]' "$CONFIG_FILE" 2>/dev/null)
+    
+    # Find a node that's not the target and is accessible
+    for potential_node in $all_nodes; do
+      if [[ "$potential_node" != "$node" ]]; then
+        if ssh_cmd_quiet "$potential_node" "echo Connected" "$PROXMOX_USER" &>/dev/null; then
+          kubectl_node="$potential_node"
+          log_info "Using $kubectl_node to run kubectl commands"
+          break
+        fi
+      fi
+    done
+  fi
+  
+  # If still no node found, we can't proceed
+  if [[ -z "$kubectl_node" ]]; then
+    log_error "Need at least one other accessible node to drain $node"
     return 1
   fi
   
@@ -198,6 +258,9 @@ function shutdown_node() {
     return 1
   fi
   
+  # Define parameters
+  local wait_for_shutdown="${1:-true}"
+  
   # Run pre-flight checks
   run_preflight_checks || return 1
   
@@ -211,6 +274,8 @@ function shutdown_node() {
     fi
   }
   
+  local shutdown_success=true
+  
   for node in "${NODES[@]}"; do
     log_section "Shutting down node $node"
     
@@ -220,6 +285,7 @@ function shutdown_node() {
     
     if [[ -z "$vm_id" || -z "$proxmox_host" ]]; then
       log_error "Could not find VM ID or Proxmox host for node $node in config"
+      shutdown_success=false
       continue
     fi
     
@@ -229,20 +295,24 @@ function shutdown_node() {
     if [[ "$is_control_plane" == "true" ]]; then
       log_info "Node $node is part of the control plane"
       
-      # Check if we have enough control plane nodes
-      local control_plane_count=0
-      for n in "${NODES[@]}"; do
-        if [[ "$n" != "$node" ]]; then
-          local node_role=$(ssh_cmd_quiet "$n" "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'control' || echo 'worker'" "$PROXMOX_USER")
-          if [[ "$node_role" == "control" ]]; then
-            ((control_plane_count++))
-          fi
-        fi
-      done
+      # Get a working kubectl node to check control plane nodes
+      local kubectl_node="$node"
       
-      if [[ $control_plane_count -lt 1 ]]; then
+      # Get all control plane nodes directly from the cluster
+      local control_plane_nodes=$(ssh_cmd_quiet "$kubectl_node" "kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v $node" "$PROXMOX_USER")
+      
+      # If empty, also try the older master label
+      if [[ -z "$control_plane_nodes" ]]; then
+        control_plane_nodes=$(ssh_cmd_quiet "$kubectl_node" "kubectl get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v $node" "$PROXMOX_USER")
+      fi
+      
+      # Check if we found other control plane nodes
+      if [[ -z "$control_plane_nodes" ]]; then
         log_error "Cannot shutdown $node: At least one other control plane node must be available"
+        shutdown_success=false
         continue
+      else
+        log_info "Found other control plane nodes: $control_plane_nodes"
       fi
     fi
     
@@ -250,6 +320,7 @@ function shutdown_node() {
     cordon_node "$node" || {
       if [[ "$FORCE" != "true" ]]; then
         log_error "Failed to cordon node $node. Aborting shutdown."
+        shutdown_success=false
         continue
       else
         log_warn "Continuing despite cordon failure due to --force flag"
@@ -262,6 +333,7 @@ function shutdown_node() {
         log_error "Failed to drain node $node. Aborting shutdown."
         # Uncordon the node since we're not continuing
         uncordon_node "$node"
+        shutdown_success=false
         continue
       else
         log_warn "Continuing despite drain failure due to --force flag"
@@ -271,35 +343,168 @@ function shutdown_node() {
     # 3. Stop k3s service on the node
     log_info "Stopping k3s service on $node..."
     if [[ "$DRY_RUN" != "true" ]]; then
-      ssh_cmd "$node" "systemctl stop k3s.service k3s-agent.service 2>/dev/null" "root"
+      local k3s_stop_result=$(ssh_cmd_capture "$node" "systemctl stop k3s.service k3s-agent.service 2>/dev/null" "$PROXMOX_USER")
+      local exit_code=$?
+      
+      if [[ $exit_code -ne 0 ]]; then
+        log_warn "Failed to gracefully stop k3s on $node: $k3s_stop_result"
+        
+        if [[ "$FORCE" == "true" ]]; then
+          log_warn "Attempting to force stop k3s processes on $node..."
+          ssh_cmd_quiet "$node" "pkill -9 k3s 2>/dev/null" "$PROXMOX_USER"
+          sleep 5
+        fi
+      fi
+      
+      # Verify k3s is stopped
+      local k3s_status=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service k3s-agent.service 2>/dev/null || echo 'inactive'" "$PROXMOX_USER")
+      
+      if [[ "$k3s_status" == "active" ]]; then
+        log_warn "k3s service is still running on $node despite stop attempt. VM shutdown might fail."
+        
+        if [[ "$FORCE" != "true" && "$INTERACTIVE" != "true" ]]; then
+          log_error "Aborting. Use --force to continue anyway."
+          # Uncordon the node since we're not continuing
+          uncordon_node "$node"
+          shutdown_success=false
+          continue
+        elif [[ "$INTERACTIVE" == "true" ]]; then
+          if ! confirm "Continue with VM shutdown despite k3s service stop failure?"; then
+            log_error "Shutdown operation cancelled by user."
+            # Uncordon the node since we're not continuing
+            uncordon_node "$node" 
+            shutdown_success=false
+            continue
+          fi
+        fi
+      else
+        log_success "k3s service stopped on $node"
+      fi
     else
       log_info "[DRY RUN] Would stop k3s service on $node"
     fi
     
     # 4. Shutdown the VM via Proxmox
     log_info "Shutting down VM $vm_id on $proxmox_host..."
-    
+
     if [[ "$DRY_RUN" != "true" ]]; then
-      local shutdown_result=$(ssh_cmd_capture "$proxmox_host" "qm shutdown $vm_id --timeout 180" "$PROXMOX_USER")
+      # More verbose logging
+      log_info "Running command on $proxmox_host: qm shutdown $vm_id"
+      
+      # Use direct command without additional parameters
+      local shutdown_result=$(ssh_cmd_capture "$proxmox_host" "qm shutdown $vm_id" "$PROXMOX_USER")
       local exit_code=$?
       
+      # Log full result for debugging
+      log_debug "Shutdown command result: exit_code=$exit_code, output='$shutdown_result'"
+      
       if [[ $exit_code -ne 0 ]]; then
-        log_error "Failed to shutdown VM $vm_id: $shutdown_result"
+        log_warn "Failed to initiate shutdown of VM $vm_id: $shutdown_result"
         
         if [[ "$FORCE" == "true" ]]; then
           log_warn "Force flag set, attempting to stop VM..."
-          ssh_cmd_silent "$proxmox_host" "qm stop $vm_id" "$PROXMOX_USER"
+          ssh_cmd_quiet "$proxmox_host" "qm stop $vm_id" "$PROXMOX_USER"
+        elif [[ "$INTERACTIVE" == "true" ]]; then
+          if confirm "Graceful shutdown failed. Force stop VM $vm_id?"; then
+            log_info "Forcing VM $vm_id to stop..."
+            ssh_cmd_quiet "$proxmox_host" "qm stop $vm_id" "$PROXMOX_USER"
+          else
+            log_error "Cannot continue without stopping the VM. Aborting."
+            # Try to uncordon the node
+            uncordon_node "$node"
+            shutdown_success=false
+            continue
+          fi
+        else
+          log_error "Failed to shutdown VM $vm_id and --force not specified"
+          # Try to uncordon the node
+          uncordon_node "$node"
+          shutdown_success=false
+          continue
         fi
       else
         log_success "VM $vm_id shutdown initiated"
+      fi
+      
+      # Wait for VM to shutdown if requested
+      if [[ "$wait_for_shutdown" == "true" ]]; then
+        log_info "Waiting for VM $vm_id to shutdown..."
+        local timeout=180
+        local count=0
+        
+        while [[ $count -lt $timeout ]]; do
+          # Query VM status
+          local vm_status=$(ssh_cmd_quiet "$proxmox_host" "qm status $vm_id" "$PROXMOX_USER" | grep -o "status: [a-z]*" | cut -d' ' -f2)
+          
+          log_info "Current VM status: $vm_status"
+          
+          if [[ "$vm_status" == "stopped" ]]; then
+            log_success "VM $vm_id is now stopped"
+            break
+          fi
+          
+          sleep 5
+          ((count+=5))
+          log_info "Still waiting for VM $vm_id to stop... (${count}s/${timeout}s)"
+        done
+        
+        # Final check
+        local final_status=$(qm status $vm_id 2>/dev/null | grep -o "status: [a-z]*" | cut -d' ' -f2)
+        
+        if [[ "$final_status" != "stopped" ]]; then
+          log_error "Timed out waiting for VM $vm_id to stop (final status: $final_status)"
+          
+          if [[ "$FORCE" == "true" || "$INTERACTIVE" == "true" ]]; then
+            if [[ "$INTERACTIVE" != "true" ]] || confirm "Force stop VM $vm_id using 'qm stop'?"; then
+              log_info "Forcing VM $vm_id to stop..."
+              ssh_cmd_quiet "$proxmox_host" "qm stop $vm_id" "$PROXMOX_USER"
+              
+              # Wait a bit more for the forced stop
+              local force_timeout=60
+              local force_count=0
+              
+              while [[ $force_count -lt $force_timeout ]]; do
+                local vm_status=$(ssh_cmd_quiet "$proxmox_host" "qm status $vm_id" "$PROXMOX_USER" | grep -o "status: [a-z]*" | cut -d' ' -f2)
+                
+                if [[ "$vm_status" == "stopped" ]]; then
+                  log_success "VM $vm_id is now stopped (after forced stop)"
+                  break
+                fi
+                
+                sleep 5
+                ((force_count+=5))
+                log_info "Still waiting for VM $vm_id to stop after force... (${force_count}s/${force_timeout}s)"
+              done
+              
+              if [[ $force_count -ge $force_timeout ]]; then
+                log_error "Timed out waiting for VM $vm_id to stop even after forced shutdown"
+                shutdown_success=false
+                continue
+              fi
+            else
+              log_error "User declined to force stop VM. Aborting."
+              shutdown_success=false
+              continue
+            fi
+          else
+            log_error "Timed out waiting for VM $vm_id to stop"
+            shutdown_success=false
+            continue
+          fi
+        fi
       fi
     else
       log_info "[DRY RUN] Would shutdown VM $vm_id on $proxmox_host"
     fi
   done
   
-  log_success "Node shutdown operations completed"
-  return 0
+  if [[ "$shutdown_success" == "true" ]]; then
+    log_success "Node shutdown operations completed successfully"
+    return 0
+  else
+    log_warn "Some nodes failed to shutdown properly"
+    return 1
+  fi
 }
 
 # Start a previously shutdown node
@@ -330,32 +535,180 @@ function start_node() {
     
     # Wait for the node to be reachable
     log_info "Waiting for $node to be reachable..."
-    local timeout=300
+    local timeout=180  # Increase timeout to 3 minutes
     local count=0
+    local connection_attempts=0
+    local connection_success=false
+
     while [[ $count -lt $timeout ]]; do
-      if ssh -o BatchMode=yes -o ConnectTimeout=5 root@$node "echo 'OK'" &>/dev/null; then
+      # Try multiple connection attempts before considering it a failure
+      if ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no -p "$SSH_PORT" root@$node "echo 'Connected'" &>/dev/null; then
         log_success "Node $node is now reachable"
-        
-        # Wait for k3s service to be up
-        log_info "Waiting for k3s service to be up..."
-        ssh_cmd_silent "$node" "timeout 60 bash -c 'until systemctl is-active k3s.service k3s-agent.service 2>/dev/null; do sleep 5; done'" "root"
-        
-        # Uncordon the node
-        uncordon_node "$node"
-        return 0
+        connection_success=true
+        break
+      fi
+      
+      # Try with IP address if hostname resolution might be an issue
+      local node_ip=$(yq -r ".node_details.$node.ip // \"\"" "$CONFIG_FILE")
+      if [[ -n "$node_ip" ]] && ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no -p "$SSH_PORT" root@$node_ip "echo 'Connected'" &>/dev/null; then
+        log_success "Node $node (IP: $node_ip) is now reachable"
+        connection_success=true
+        break
       fi
       
       sleep 5
       ((count+=5))
       log_info "Still waiting for $node... (${count}s/${timeout}s)"
+      
+      # Check VM status every 15 seconds to confirm it's running
+      if (( count % 15 == 0 )); then
+        local vm_status=$(ssh_cmd_quiet "$proxmox_host" "qm status $vm_id" "$PROXMOX_USER" | grep -o "status: [a-z]*" | cut -d' ' -f2)
+        log_info "Current VM status: $vm_status"
+      fi
     done
     
-    log_error "Timed out waiting for $node to be reachable"
-    return 1
+    if [[ "$connection_success" != "true" ]]; then
+      log_error "Timed out waiting for $node to be reachable"
+      return 1
+    fi
   else
     log_info "[DRY RUN] Would start VM $vm_id on $proxmox_host"
     return 0
   fi
+}
+
+# Cleanup node after a failed operation
+function cleanup_node() {
+  local node="$1"
+  local operation="$2"  # snapshot, backup, replace, etc.
+  local etcd_snapshot="$3"  # Optional etcd snapshot to clean up
+  
+  log_section "Cleaning up node $node after failed $operation"
+  
+  # 1. Check if node is cordoned
+  local kubectl_node=""
+  local all_nodes=$(yq -r '.nodes[]' "$CONFIG_FILE" 2>/dev/null)
+  
+  # Find another node that's accessible to run kubectl
+  for potential_node in $all_nodes; do
+    if [[ "$potential_node" != "$node" ]]; then
+      if ssh_cmd_quiet "$potential_node" "echo Connected" "$PROXMOX_USER" &>/dev/null; then
+        kubectl_node="$potential_node"
+        break
+      fi
+    fi
+  done
+  
+  if [[ -n "$kubectl_node" ]]; then
+    # Check if node is cordoned
+    local node_status=$(ssh_cmd_quiet "$kubectl_node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "$PROXMOX_USER")
+    
+    if [[ "$node_status" == "true" ]]; then
+      log_info "Node $node is cordoned, uncordoning..."
+      uncordon_node "$node"
+    fi
+  fi
+  
+  # 2. Check k3s service status and start if needed
+  log_info "Checking k3s service status on $node..."
+  local k3s_status=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service 2>/dev/null || echo 'inactive'" "$PROXMOX_USER")
+  
+  log_info "k3s service status: $k3s_status"
+  
+  # Always attempt to start the service unless it's already active
+  if [[ "$k3s_status" != "active" ]]; then
+    log_info "Starting k3s service on $node..."
+    ssh_cmd_quiet "$node" "systemctl start k3s.service" "$PROXMOX_USER"
+    
+    # Wait for service to start
+    local timeout=90
+    local count=0
+    while [[ $count -lt $timeout ]]; do
+      k3s_status=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service 2>/dev/null || echo 'inactive'" "$PROXMOX_USER")
+      
+      if [[ "$k3s_status" == "active" ]]; then
+        log_success "k3s service started on $node"
+        break
+      fi
+      
+      sleep 5
+      ((count+=5))
+      log_info "Waiting for k3s service to start... (${count}s/${timeout}s)"
+    done
+    
+    if [[ $count -ge $timeout ]]; then
+      log_error "Failed to start k3s service on $node"
+    fi
+  else
+    log_info "k3s service is already active on $node"
+  fi
+  
+  # Additional verification - check if node shows as Ready
+  if [[ -n "$kubectl_node" ]]; then
+    log_info "Waiting for node $node to be Ready..."
+    local timeout=120
+    local count=0
+    
+    while [[ $count -lt $timeout ]]; do
+      local ready_status=$(ssh_cmd_quiet "$kubectl_node" "kubectl get node $node -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'" "$PROXMOX_USER")
+      
+      if [[ "$ready_status" == "True" ]]; then
+        log_success "Node $node is now Ready"
+        break
+      fi
+      
+      sleep 10
+      ((count+=10))
+      log_info "Waiting for node $node to be Ready... (${count}s/${timeout}s)"
+    done
+    
+    if [[ $count -ge $timeout ]]; then
+      log_warn "Timed out waiting for node $node to be Ready"
+    fi
+  fi
+  
+  # 3. Clean up the etcd snapshot if provided
+  if [[ -n "$etcd_snapshot" ]]; then
+    log_info "Cleaning up etcd snapshot: $etcd_snapshot"
+    
+    # Find a suitable node to run the cleanup
+    local etcd_node="$node"
+    local is_server=$(ssh_cmd_quiet "$etcd_node" "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" "$PROXMOX_USER")
+    
+    if [[ "$is_server" != "true" ]]; then
+      # Try to find another server node
+      for potential_node in $all_nodes; do
+        if [[ "$potential_node" != "$node" ]]; then
+          is_server=$(ssh_cmd_quiet "$potential_node" "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" "$PROXMOX_USER")
+          if [[ "$is_server" == "true" ]]; then
+            etcd_node="$potential_node"
+            break
+          fi
+        fi
+      done
+    fi
+    
+    # List all etcd snapshots and identify any that match the pattern
+    log_info "Listing etcd snapshots matching pattern: $etcd_snapshot"
+    local snapshot_files=$(ssh_cmd_quiet "$etcd_node" "ls -1 /var/lib/rancher/k3s/server/db/snapshots/ | grep '$etcd_snapshot'" "$PROXMOX_USER")
+    
+    if [[ -n "$snapshot_files" ]]; then
+      log_info "Found matching etcd snapshot files:"
+      echo "$snapshot_files"
+      
+      # Delete each matching file
+      while read -r snapshot_file; do
+        log_info "Deleting etcd snapshot file: $snapshot_file"
+        ssh_cmd_quiet "$etcd_node" "rm -f /var/lib/rancher/k3s/server/db/snapshots/$snapshot_file" "$PROXMOX_USER"
+      done <<< "$snapshot_files"
+      
+      log_success "Etcd snapshots cleaned up"
+    else
+      log_warn "No matching etcd snapshot files found for pattern: $etcd_snapshot"
+    fi
+  fi
+  
+  log_success "Cleanup completed"
 }
 
 # Replace a node in the cluster
@@ -533,7 +886,7 @@ function replace_node() {
     
     # Wait for the node to be reachable
     log_info "Waiting for $node to be reachable..."
-    local timeout=300
+    local timeout=120
     local count=0
     while [[ $count -lt $timeout ]]; do
       if ssh -o BatchMode=yes -o ConnectTimeout=5 root@$node "echo 'OK'" &>/dev/null; then

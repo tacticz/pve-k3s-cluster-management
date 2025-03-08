@@ -59,6 +59,11 @@ function check_k3s_version() {
     # Get K3s version
     local version=$(ssh_cmd "$node" "k3s --version 2>/dev/null || echo 'Not installed'" "$PROXMOX_USER")
     
+    # Clean debug output from the version string if DEBUG is true
+    if [[ "$DEBUG" == "true" ]]; then
+      version=$(echo "$version" | grep -v '\[DEBUG\]')
+    fi
+
     if [[ "$version" == "Not installed" ]]; then
       log_error "K3s not installed on $node"
       return 1
@@ -121,21 +126,33 @@ function check_cluster_health() {
   # Get components status
   local components_status=$(ssh_cmd_quiet "$first_node" "kubectl get componentstatuses" "$PROXMOX_USER")
   
+  # Clean debug output
+  if [[ "$DEBUG" == "true" ]]; then
+    components_status=$(echo "$components_status" | grep -v '\[DEBUG\]')
+  fi
+
   if [[ $? -ne 0 ]]; then
     log_warn "Failed to get component status (this might be expected with newer Kubernetes versions)"
   else
     log_info "Component status:"
     echo "$components_status"
     
-    # Check for unhealthy components
-    if echo "$components_status" | grep -v "Healthy"; then
+    # Check for unhealthy components - only check the STATUS column for non-Healthy values
+    if echo "$components_status" | grep -v "NAME\|STATUS" | grep -v "Healthy"; then
       log_warn "Some components might not be healthy"
+    else
+      log_success "All components are healthy"
     fi
   fi
   
-  # Check for pending pods
-  local pending_pods=$(ssh_cmd_quiet "$first_node" "kubectl get pods --all-namespaces | grep -v Running | grep -v Completed" "$PROXMOX_USER")
+  # Check for pending pods - better filter for actual problem pods
+  local pending_pods=$(ssh_cmd_quiet "$first_node" "kubectl get pods --all-namespaces | grep -v Running | grep -v Completed | grep -v NAME" "$PROXMOX_USER")
   
+  # Clean debug output
+  if [[ "$DEBUG" == "true" ]]; then
+    pending_pods=$(echo "$pending_pods" | grep -v '\[DEBUG\]')
+  fi
+
   if [[ -n "$pending_pods" ]]; then
     log_warn "Some pods are not in Running/Completed state:"
     echo "$pending_pods"
@@ -368,7 +385,8 @@ function run_preflight_checks() {
   for node in "${NODES[@]}"; do
     log_info "Testing SSH connection to $node..."
     
-    ssh -o BatchMode=yes -o ConnectTimeout=5 root@$node "echo 'Connected'" &>/dev/null
+    # Use the same ssh_cmd_quiet function used elsewhere
+    ssh_cmd_quiet "$node" "echo 'Connected'" "$PROXMOX_USER"
     
     if [[ $? -ne 0 ]]; then
       log_error "Cannot SSH to $node"

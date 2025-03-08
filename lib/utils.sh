@@ -168,8 +168,20 @@ function ssh_cmd() {
   local cmd="$2"
   local user="${3:-root}"
   
-  ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd"
-  return $?
+  # Get local hostname
+  local hostname=$(hostname -f)
+  local short_hostname=$(hostname -s)
+  
+  # Check if target is local host
+  if [[ "$target" == "localhost" || "$target" == "127.0.0.1" || "$target" == "$hostname" || "$target" == "$short_hostname" ]]; then
+    log_debug "Executing command locally: $cmd"
+    eval "$cmd"
+    return $?
+  else
+    log_debug "Executing command via SSH on $target: $cmd"
+    ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd"
+    return $?
+  fi
 }
 
 # SSH wrapper - all output suppressed (both stdout and stderr)
@@ -177,9 +189,21 @@ function ssh_cmd_silent() {
   local target="$1"
   local cmd="$2"
   local user="${3:-root}"
+
+  # Get local hostname
+  local hostname=$(hostname -f)
+  local short_hostname=$(hostname -s)
   
-  ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd" &>/dev/null
-  return $?
+  # Check if target is local host
+  if [[ "$target" == "localhost" || "$target" == "127.0.0.1" || "$target" == "$hostname" || "$target" == "$short_hostname" ]]; then
+    log_debug "Executing command locally: $cmd"
+    eval "$cmd" &>/dev/null
+    return $?
+  else
+    log_debug "Executing command via SSH on $target: $cmd"
+    ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd" &>/dev/null
+    return $?
+  fi
 }
 
 # SSH wrapper - errors suppressed
@@ -188,8 +212,20 @@ function ssh_cmd_quiet() {
   local cmd="$2"
   local user="${3:-root}"
   
-  ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd" 2>/dev/null
-  return $?
+  # Get local hostname
+  local hostname=$(hostname -f)
+  local short_hostname=$(hostname -s)
+  
+  # Check if target is local host
+  if [[ "$target" == "localhost" || "$target" == "127.0.0.1" || "$target" == "$hostname" || "$target" == "$short_hostname" ]]; then
+    log_debug "Executing command locally: $cmd"
+    eval "$cmd" 2>/dev/null
+    return $?
+  else
+    log_debug "Executing command via SSH on $target: $cmd"
+    ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd" 2>/dev/null
+    return $?
+  fi
 }
 
 # SSH wrapper - errors captured with output
@@ -198,8 +234,20 @@ function ssh_cmd_capture() {
   local cmd="$2"
   local user="${3:-root}"
   
-  ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd" 2>&1
-  return $?
+  # Get local hostname
+  local hostname=$(hostname -f)
+  local short_hostname=$(hostname -s)
+  
+  # Check if target is local host
+  if [[ "$target" == "localhost" || "$target" == "127.0.0.1" || "$target" == "$hostname" || "$target" == "$short_hostname" ]]; then
+    log_debug "Executing command locally: $cmd"
+    eval "$cmd" 2>&1
+    return $?
+  else
+    log_debug "Executing command via SSH on $target: $cmd"
+    ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd" 2>&1
+    return $?
+  fi
 }
 
 # Run in interactive mode
