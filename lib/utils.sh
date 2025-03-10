@@ -162,25 +162,225 @@ function check_required_commands() {
   return 0
 }
 
-# SSH wrapper - errors shown
+# Add a host key to known_hosts file
+function add_host_key() {
+  local host="$1"
+  local port="${2:-$SSH_PORT}"
+  
+  log_info "Adding host key for $host to known_hosts file..."
+  
+  # Use ssh-keyscan to get the host key and append it to known_hosts
+  if ssh-keyscan -p "$port" -H "$host" >> ~/.ssh/known_hosts 2>/dev/null; then
+    log_success "Host key for $host added to known_hosts file"
+    return 0
+  else
+    log_error "Failed to add host key for $host"
+    return 1
+  fi
+}
+
+# Verify SSH host keys and ensure connections can be made without prompts
+function verify_ssh_hosts() {
+  log_section "Verifying SSH connectivity to hosts"
+  
+  # Clear existing host keys if --force is used
+  if [[ "$FORCE" == "true" ]]; then
+    log_info "Force mode enabled, clearing any existing host keys..."
+    
+    # Clear keys for nodes
+    for node in "${NODES[@]}"; do
+      log_info "Removing any existing host keys for $node..."
+      ssh-keygen -R "$node" >/dev/null 2>&1
+    done
+    
+    # Clear keys for Proxmox hosts
+    for host in "${PROXMOX_HOSTS[@]}"; do
+      log_info "Removing any existing host keys for $host..."
+      ssh-keygen -R "$host" >/dev/null 2>&1
+      # Also try with FQDN if different
+      ssh-keygen -R "$host.ldv.corp" >/dev/null 2>&1
+    done
+  fi
+
+  # First check connectivity to nodes
+  log_info "Verifying connectivity to cluster nodes..."
+  for node in "${NODES[@]}"; do
+    log_info "Testing connection to node: $node"
+    
+    # Check if we can connect without prompts
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" root@$node "echo Connected" &>/dev/null; then
+      log_warn "Cannot connect to $node without prompt, attempting to accept host key..."
+      
+      # Accept and permanently add the host key
+      if [[ "$FORCE" == "true" ]]; then
+        log_info "Force mode enabled, automatically adding node key"
+        add_host_key "$node" "$SSH_PORT"
+      else
+        # Interactive mode
+        log_info "SSH connection requires host key verification for node $node"
+        log_info "To continue non-interactively in the future, use the --force flag"
+        
+        if [[ "$INTERACTIVE" == "true" ]]; then
+          if confirm "Accept and add host key for node $node?"; then
+            add_host_key "$node" "$SSH_PORT"
+          else
+            log_error "Host key verification rejected, cannot continue"
+            return 1
+          fi
+        else
+          log_error "Host key verification required for node $node. Run in interactive mode or use --force"
+          return 1
+        fi
+      fi
+
+      # Verify connection after adding the key
+      local result=0
+      if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" root@$node "echo Connected" &>/dev/null; then
+        log_error "Failed to connect to $node despite adding host key"
+        result=1
+      else
+        log_success "Connection to $node verified after adding host key"
+      fi
+
+      return $result
+    else
+      log_success "Connection to $node verified"
+    fi
+  done
+  
+  # Then check connectivity to Proxmox hosts
+  log_info "Verifying connectivity to Proxmox hosts..."
+  for host in "${PROXMOX_HOSTS[@]}"; do
+    log_info "Testing connection to Proxmox host: $host"
+    
+    # Skip if host is one of the nodes we already verified
+    local already_verified=false
+    for node in "${NODES[@]}"; do
+      if [[ "$host" == "$node" ]]; then
+        already_verified=true
+        break
+      fi
+    done
+    
+    if [[ "$already_verified" == "true" ]]; then
+      log_info "Host $host already verified as a node"
+      continue
+    fi
+    
+    # Check if we can connect without prompts
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" root@$host "echo Connected" &>/dev/null; then
+      log_warn "Cannot connect to $host without prompt, attempting to accept host key..."
+      
+      # Accept and permanently add the host key
+      if [[ "$FORCE" == "true" ]]; then
+        log_info "Force mode enabled, automatically adding host key"
+        add_host_key "$host" "$SSH_PORT"
+      else
+        # Interactive mode
+        log_info "SSH connection requires host key verification for host $host"
+        log_info "To continue non-interactively in the future, use the --force flag"
+        
+        if [[ "$INTERACTIVE" == "true" ]]; then
+          if confirm "Accept and add host key for host $host?"; then
+            add_host_key "$host" "$SSH_PORT"
+          else
+            log_error "Host key verification rejected, cannot continue"
+            return 1
+          fi
+        else
+          log_error "Host key verification required for host $host. Run in interactive mode or use --force"
+          return 1
+        fi
+      fi
+
+      # Verify connection after adding the key
+      local result=0
+      if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" root@$host "echo Connected" &>/dev/null; then
+        log_error "Failed to connect to $host despite adding host key"
+        result=1
+      else
+        log_success "Connection to $host verified after adding host key"
+      fi
+
+      return $result
+    else
+      log_success "Connection to $host verified"
+    fi
+  done
+  
+  log_success "All SSH connections verified"
+  return 0
+}
+
+# Unified SSH command executor with flexible output options
 function ssh_cmd() {
+  # Default values
   local target="$1"
   local cmd="$2"
   local user="${3:-root}"
+  local mode="${4:-normal}"  # normal, silent, quiet, capture
+  local port="${SSH_PORT:-22}"
   
-  # Get local hostname
+  # Get local hostname for local execution detection
   local hostname=$(hostname -f)
   local short_hostname=$(hostname -s)
   
+  # More detailed debug information
+  log_debug "SSH command details:"
+  log_debug "  Target: $target"
+  log_debug "  User: $user"
+  log_debug "  Mode: $mode"
+  log_debug "  Port: $port"
+  log_debug "  Command: $cmd"
+  
   # Check if target is local host
   if [[ "$target" == "localhost" || "$target" == "127.0.0.1" || "$target" == "$hostname" || "$target" == "$short_hostname" ]]; then
-    log_debug "Executing command locally: $cmd"
-    eval "$cmd"
-    return $?
+    log_debug "Executing command locally"
+    
+    case "$mode" in
+      silent)
+        eval "$cmd" &>/dev/null
+        return $?
+        ;;
+      quiet)
+        eval "$cmd" 2>/dev/null
+        return $?
+        ;;
+      capture)
+        eval "$cmd" 2>&1
+        return $?
+        ;;
+      *)
+        eval "$cmd"
+        return $?
+        ;;
+    esac
   else
-    log_debug "Executing command via SSH on $target: $cmd"
-    ssh -o BatchMode=yes -p "$SSH_PORT" $user@$target "$cmd"
-    return $?
+    # Additional debug info for SSH connection
+    log_debug "Executing command via SSH to $target:$port as $user"
+    
+    # Properly quote and escape the command to prevent shell interpretation issues
+    # Use single quotes to prevent local shell expansion
+    local escaped_cmd=$(printf "%q" "$cmd")
+    
+    case "$mode" in
+      silent)
+        ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$port" $user@$target "$escaped_cmd" &>/dev/null
+        return $?
+        ;;
+      quiet)
+        ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$port" $user@$target "$escaped_cmd" 2>/dev/null
+        return $?
+        ;;
+      capture)
+        ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$port" $user@$target "$escaped_cmd" 2>&1
+        return $?
+        ;;
+      *)
+        ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$port" $user@$target "$escaped_cmd"
+        return $?
+        ;;
+    esac
   fi
 }
 
@@ -268,6 +468,15 @@ function run_interactive_mode() {
   echo "0. Exit"
   
   read -p "Select an option (0-9): " option
+  
+  # Add this block RIGHT HERE to verify SSH hosts immediately after option selection
+  # but before any option-specific operations
+  case "$option" in
+    1|2|3|4|5|6|7)
+      # For options that require SSH, verify connectivity first
+      verify_ssh_hosts || return 1
+      ;;
+  esac
   
   case "$option" in
     1)

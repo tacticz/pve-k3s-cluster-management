@@ -378,36 +378,34 @@ function check_proxmox_connectivity() {
 # Pre-flight checks before running operations
 function run_preflight_checks() {
   log_section "Running Pre-flight Checks"
+
+  # Verify SSH connectivity to all hosts and handle host key verification
+  log_info "Verifying SSH connectivity to hosts and Proxmox servers..."
+  verify_ssh_hosts || return 1
   
-  # Check SSH connectivity to all nodes
-  log_info "Checking SSH connectivity to all nodes..."
-  
-  for node in "${NODES[@]}"; do
-    log_info "Testing SSH connection to $node..."
-    
-    # Use the same ssh_cmd_quiet function used elsewhere
-    ssh_cmd_quiet "$node" "echo 'Connected'" "$PROXMOX_USER"
-    
-    if [[ $? -ne 0 ]]; then
-      log_error "Cannot SSH to $node"
-      return 1
-    fi
-  done
-  
-  log_success "SSH connectivity to all nodes verified"
+  # Since verify_ssh_hosts already checked SSH connectivity to all nodes,
+  # we can skip the redundant connectivity check and proceed to checking kubectl
   
   # Check kubectl availability on the first node
   local first_node="${NODES[0]}"
   log_info "Checking kubectl availability on $first_node..."
-  
-  local kubectl_check=$(ssh_cmd_quiet "$first_node" "command -v kubectl >/dev/null && echo 'OK' || echo 'FAIL'" "$PROXMOX_USER")
-  
-  if [[ "$kubectl_check" != "OK" ]]; then
-    log_error "kubectl not available on $first_node"
-    return 1
+
+  # Test kubectl command with more comprehensive approach
+  local kubectl_check=$(ssh_cmd "$first_node" "which kubectl || find /usr/local/bin -name kubectl | grep kubectl || echo 'NOT_FOUND'" "$PROXMOX_USER" "capture")
+
+  if [[ "$kubectl_check" == "NOT_FOUND" ]]; then
+    # Alternative check - k3s comes with kubectl built-in via the k3s binary
+    local k3s_check=$(ssh_cmd "$first_node" "k3s kubectl get nodes" "$PROXMOX_USER" "quiet")
+    
+    if [[ $? -eq 0 ]]; then
+      log_success "kubectl available via k3s command on $first_node"
+    else
+      log_error "kubectl not available on $first_node (neither native kubectl nor via k3s command)"
+      return 1
+    fi
+  else
+    log_success "kubectl found at: $kubectl_check"
   fi
-  
-  log_success "kubectl available on $first_node"
   
   return 0
 }

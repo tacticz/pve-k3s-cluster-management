@@ -391,8 +391,8 @@ function shutdown_node() {
       # More verbose logging
       log_info "Running command on $proxmox_host: qm shutdown $vm_id"
       
-      # Use direct command without additional parameters
-      local shutdown_result=$(ssh_cmd_capture "$proxmox_host" "qm shutdown $vm_id" "$PROXMOX_USER")
+      # Use the unified ssh_cmd with capture mode for better error detection
+      local shutdown_result=$(ssh_cmd "$proxmox_host" "qm shutdown $vm_id" "$PROXMOX_USER" "capture")
       local exit_code=$?
       
       # Log full result for debugging
@@ -403,11 +403,11 @@ function shutdown_node() {
         
         if [[ "$FORCE" == "true" ]]; then
           log_warn "Force flag set, attempting to stop VM..."
-          ssh_cmd_quiet "$proxmox_host" "qm stop $vm_id" "$PROXMOX_USER"
+          ssh_cmd "$proxmox_host" "qm stop $vm_id" "$PROXMOX_USER" "quiet"
         elif [[ "$INTERACTIVE" == "true" ]]; then
           if confirm "Graceful shutdown failed. Force stop VM $vm_id?"; then
             log_info "Forcing VM $vm_id to stop..."
-            ssh_cmd_quiet "$proxmox_host" "qm stop $vm_id" "$PROXMOX_USER"
+            ssh_cmd "$proxmox_host" "qm stop $vm_id" "$PROXMOX_USER" "quiet"
           else
             log_error "Cannot continue without stopping the VM. Aborting."
             # Try to uncordon the node
@@ -433,8 +433,8 @@ function shutdown_node() {
         local count=0
         
         while [[ $count -lt $timeout ]]; do
-          # Query VM status
-          local vm_status=$(ssh_cmd_quiet "$proxmox_host" "qm status $vm_id" "$PROXMOX_USER" | grep -o "status: [a-z]*" | cut -d' ' -f2)
+          # Query VM status with the unified ssh_cmd
+          local vm_status=$(ssh_cmd "$proxmox_host" "qm status $vm_id | grep -o 'status: [a-z]*' | cut -d' ' -f2" "$PROXMOX_USER" "quiet")
           
           log_info "Current VM status: $vm_status"
           
