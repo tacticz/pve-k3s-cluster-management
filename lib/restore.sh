@@ -86,7 +86,7 @@ local is_server=$(ssh_cmd_quiet "$first_node" "systemctl is-active k3s.service >
   
   # Wait for k3s to start
   log_info "Waiting for k3s to start on $first_node..."
-  local timeout=180
+  local timeout=90
   local count=0
   while [[ $count -lt $timeout ]]; do
     local status=$(ssh_cmd_quiet "$first_node" "systemctl is-active k3s.service" "$PROXMOX_USER")
@@ -756,7 +756,7 @@ function run_restore_wizard() {
       
       # Wait for node to be online
       log_info "Waiting for node $selected_node to come online..."
-      local timeout=180
+      local timeout=120
       local count=0
       while [[ $count -lt $timeout ]]; do
         if ssh -o BatchMode=yes -o ConnectTimeout=5 root@$selected_node "echo 'OK'" &>/dev/null; then

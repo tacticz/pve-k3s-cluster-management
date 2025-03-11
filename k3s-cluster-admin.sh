@@ -167,6 +167,18 @@ function main() {
     print_config
   fi
 
+  # Check for commands that require SSH connectivity
+  case "$COMMAND" in
+    validate|shutdown|backup|snapshot|replace)
+      # Verify SSH connectivity to all hosts early
+      log_info "Verifying SSH connectivity for command: $COMMAND"
+      verify_ssh_hosts || {
+        log_error "Failed to verify SSH connectivity to all hosts"
+        exit 1
+      }
+      ;;
+  esac
+
   # Check for interactive mode
   if [[ "$INTERACTIVE" == "true" ]]; then
     run_interactive_mode

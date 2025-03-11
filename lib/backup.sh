@@ -415,6 +415,34 @@ function snapshot_cluster() {
             
             # Uncordon the node now that it's ready
             log_info "Uncordoning master node $node..."
+
+            log_debug "Finding a node to run kubectl from..."
+            for check_node in "${original_nodes[@]}"; do
+              log_debug "Testing if $check_node can run kubectl..."
+              if ssh_cmd_silent "$check_node" "kubectl get nodes" "$PROXMOX_USER"; then
+                log_debug "Success: $check_node can run kubectl"
+                found_kubectl_node="$check_node"
+                break
+              else
+                log_debug "Failed: $check_node cannot run kubectl"
+              fi
+            done
+
+            if [[ -n "$found_kubectl_node" ]]; then
+              log_debug "Using $found_kubectl_node to check cordon status of $node"
+              local is_cordoned=$(ssh_cmd_quiet "$found_kubectl_node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "$PROXMOX_USER")
+              log_debug "Cordon status for $node: '$is_cordoned'"
+              
+              if [[ "$is_cordoned" == "true" ]]; then
+                log_info "Node $node is cordoned, attempting to uncordon using $found_kubectl_node"
+                uncordon_node "$node"
+              else
+                log_info "Node $node is already schedulable"
+              fi
+            else
+              log_debug "No kubectl-capable node found to check $node"
+            fi
+
             uncordon_node "$node" || {
               log_warn "Failed to uncordon node $node. Node may still be cordoned."
             }
@@ -450,7 +478,98 @@ function snapshot_cluster() {
   validate_cluster || {
     log_warn "Cluster validation after snapshots showed issues. Check cluster state."
   }
-  
+
+  # Directly uncordon the node if needed
+  for node in "${NODES[@]}"; do
+    log_info "Ensuring node $node is uncordoned after snapshot..."
+    
+    # Find any node other than the one we're checking
+    local kubectl_node=""
+    for potential_node in "${original_nodes[@]}"; do
+      if [[ "$potential_node" != "$node" ]]; then
+        # Test if this node is accessible
+        if ssh_cmd_silent "$potential_node" "ls /usr/local/bin/kubectl || ls /var/lib/rancher/k3s/bin/kubectl" "root"; then
+          kubectl_node="$potential_node"
+          log_info "Found accessible node $kubectl_node to run kubectl"
+          break
+        fi
+      fi
+    done
+    
+    if [[ -n "$kubectl_node" ]]; then
+      # Check if node is cordoned
+      log_info "Checking if node $node is cordoned..."
+      local is_cordoned=$(ssh_cmd_quiet "$kubectl_node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "root")
+      
+      if [[ "$is_cordoned" == "true" ]]; then
+        log_info "Node $node is cordoned, uncordoning it..."
+        ssh_cmd "$kubectl_node" "kubectl uncordon $node" "root"
+        sleep 2
+        
+        # Verify uncordon was successful
+        local still_cordoned=$(ssh_cmd_quiet "$kubectl_node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "root")
+        if [[ "$still_cordoned" == "true" ]]; then
+          log_warn "Node $node is still cordoned after uncordon attempt"
+        else
+          log_success "Node $node successfully uncordoned"
+        fi
+      else
+        log_info "Node $node is already schedulable"
+      fi
+    else
+      # As a last resort, try to uncordon from the node itself
+      log_info "No other node available, trying to uncordon from node itself..."
+      if ssh_cmd_silent "$node" "kubectl uncordon $node" "root"; then
+        log_success "Node $node successfully self-uncordoned"
+      else
+        log_warn "Failed to uncordon node $node"
+      fi
+    fi
+  done
+
+  # Ensure all nodes are uncordoned
+  log_info "Ensuring all nodes are uncordoned after snapshot operations..."
+
+  for node in "${original_nodes[@]}"; do
+    # Check if node is cordoned
+    if [[ "$DRY_RUN" != "true" ]]; then
+      # Find a working node to run kubectl from
+      local kubectl_node=""
+      for check_node in "${original_nodes[@]}"; do
+        if ssh -o BatchMode=yes -o ConnectTimeout=2 "root@$check_node" "kubectl get nodes" &>/dev/null; then
+          kubectl_node="$check_node"
+          break
+        fi
+      done
+      
+      if [[ -n "$kubectl_node" ]]; then
+        # Check if node is cordoned
+        local node_status=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@$kubectl_node "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" 2>/dev/null)
+        
+        if [[ "$node_status" == "true" ]]; then
+          log_info "Node $node is still cordoned, uncordoning..."
+          
+          # Use direct SSH command to uncordon
+          local uncordon_cmd="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@$kubectl_node \"kubectl uncordon $node\""
+          local uncordon_output=$(eval "$uncordon_cmd" 2>&1)
+          local uncordon_exit_code=$?
+          
+          if [[ $uncordon_exit_code -eq 0 ]]; then
+            log_success "Node $node uncordoned successfully"
+          else
+            log_warn "Failed to uncordon node $node: $uncordon_output"
+          fi
+        else
+          log_info "Node $node is already schedulable"
+        fi
+      else
+        log_warn "Could not find a working node to uncordon $node"
+      fi
+    else
+      log_info "[DRY RUN] Would ensure node $node is uncordoned"
+    fi
+  done
+
   # Clean up old snapshots based on retention policy
   clean_old_snapshots
   

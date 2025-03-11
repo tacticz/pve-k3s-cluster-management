@@ -162,19 +162,85 @@ function check_required_commands() {
   return 0
 }
 
-# Add a host key to known_hosts file
+# Improved host key management function
 function add_host_key() {
   local host="$1"
   local port="${2:-$SSH_PORT}"
   
   log_info "Adding host key for $host to known_hosts file..."
   
-  # Use ssh-keyscan to get the host key and append it to known_hosts
+  # Get IP address (if host is a hostname)
+  local host_ip=""
+  if [[ ! "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    host_ip=$(getent hosts "$host" | awk '{print $1}' | head -1)
+    log_debug "Resolved $host to IP: $host_ip"
+  fi
+  
+  # Generate FQDN if it appears to be a short hostname
+  local host_fqdn=""
+  if [[ ! "$host" =~ \. && ! "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    # Try to append domain from /etc/resolv.conf
+    local domain=$(grep "^domain\|^search" /etc/resolv.conf | head -1 | awk '{print $2}')
+    if [[ -n "$domain" ]]; then
+      host_fqdn="${host}.${domain}"
+      log_debug "Generated FQDN: $host_fqdn"
+    fi
+  fi
+  
+  # Create known_hosts file directory if it doesn't exist
+  mkdir -p ~/.ssh
+  touch ~/.ssh/known_hosts
+  
+  # Remove any existing entries for this host to avoid duplicates or old keys
+  log_debug "Removing any existing host keys for $host"
+  ssh-keygen -R "$host" >/dev/null 2>&1
+  
+  # Also remove entries for IP and FQDN if available
+  if [[ -n "$host_ip" ]]; then
+    log_debug "Removing any existing host keys for IP $host_ip"
+    ssh-keygen -R "$host_ip" >/dev/null 2>&1
+  fi
+  
+  if [[ -n "$host_fqdn" ]]; then
+    log_debug "Removing any existing host keys for FQDN $host_fqdn"
+    ssh-keygen -R "$host_fqdn" >/dev/null 2>&1
+  fi
+  
+  # Use ssh-keyscan to get host keys and add them to known_hosts
+  log_debug "Scanning for host keys (hostname: $host, port: $port)"
   if ssh-keyscan -p "$port" -H "$host" >> ~/.ssh/known_hosts 2>/dev/null; then
     log_success "Host key for $host added to known_hosts file"
-    return 0
   else
     log_error "Failed to add host key for $host"
+    return 1
+  fi
+  
+  # Additionally add IP and FQDN if available
+  if [[ -n "$host_ip" ]]; then
+    log_debug "Scanning for host keys (IP: $host_ip, port: $port)"
+    if ssh-keyscan -p "$port" -H "$host_ip" >> ~/.ssh/known_hosts 2>/dev/null; then
+      log_success "Host key for IP $host_ip added to known_hosts file"
+    else
+      log_warn "Failed to add host key for IP $host_ip"
+    fi
+  fi
+  
+  if [[ -n "$host_fqdn" ]]; then
+    log_debug "Scanning for host keys (FQDN: $host_fqdn, port: $port)"
+    if ssh-keyscan -p "$port" -H "$host_fqdn" >> ~/.ssh/known_hosts 2>/dev/null; then
+      log_success "Host key for FQDN $host_fqdn added to known_hosts file"
+    else
+      log_warn "Failed to add host key for FQDN $host_fqdn"
+    fi
+  fi
+  
+  # Verify key was actually added by testing connection
+  log_debug "Testing SSH connection to $host with new key"
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$port" root@$host "echo Connected" &>/dev/null; then
+    log_success "SSH connection to $host verified successfully"
+    return 0
+  else
+    log_error "SSH connection to $host still fails after adding host key"
     return 1
   fi
 }
@@ -183,136 +249,161 @@ function add_host_key() {
 function verify_ssh_hosts() {
   log_section "Verifying SSH connectivity to hosts"
   
-  # Clear existing host keys if --force is used
-  if [[ "$FORCE" == "true" ]]; then
-    log_info "Force mode enabled, clearing any existing host keys..."
-    
-    # Clear keys for nodes
-    for node in "${NODES[@]}"; do
-      log_info "Removing any existing host keys for $node..."
-      ssh-keygen -R "$node" >/dev/null 2>&1
-    done
-    
-    # Clear keys for Proxmox hosts
-    for host in "${PROXMOX_HOSTS[@]}"; do
-      log_info "Removing any existing host keys for $host..."
-      ssh-keygen -R "$host" >/dev/null 2>&1
-      # Also try with FQDN if different
-      ssh-keygen -R "$host.ldv.corp" >/dev/null 2>&1
-    done
-  fi
-
-  # First check connectivity to nodes
-  log_info "Verifying connectivity to cluster nodes..."
+  # First, verify that we can locate all nodes and hosts
+  log_debug "Nodes configured: ${NODES[*]}"
+  log_debug "Proxmox hosts configured: ${PROXMOX_HOSTS[*]}"
+  
+  # Collect all hosts that need verification
+  declare -a all_hosts=()
+  
+  # Add all nodes
   for node in "${NODES[@]}"; do
-    log_info "Testing connection to node: $node"
-    
-    # Check if we can connect without prompts
-    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" root@$node "echo Connected" &>/dev/null; then
-      log_warn "Cannot connect to $node without prompt, attempting to accept host key..."
-      
-      # Accept and permanently add the host key
-      if [[ "$FORCE" == "true" ]]; then
-        log_info "Force mode enabled, automatically adding node key"
-        add_host_key "$node" "$SSH_PORT"
-      else
-        # Interactive mode
-        log_info "SSH connection requires host key verification for node $node"
-        log_info "To continue non-interactively in the future, use the --force flag"
-        
-        if [[ "$INTERACTIVE" == "true" ]]; then
-          if confirm "Accept and add host key for node $node?"; then
-            add_host_key "$node" "$SSH_PORT"
-          else
-            log_error "Host key verification rejected, cannot continue"
-            return 1
-          fi
-        else
-          log_error "Host key verification required for node $node. Run in interactive mode or use --force"
-          return 1
-        fi
-      fi
-
-      # Verify connection after adding the key
-      local result=0
-      if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" root@$node "echo Connected" &>/dev/null; then
-        log_error "Failed to connect to $node despite adding host key"
-        result=1
-      else
-        log_success "Connection to $node verified after adding host key"
-      fi
-
-      return $result
-    else
-      log_success "Connection to $node verified"
-    fi
+    log_debug "Adding node to verification list: $node"
+    all_hosts+=("$node")
   done
   
-  # Then check connectivity to Proxmox hosts
-  log_info "Verifying connectivity to Proxmox hosts..."
+  # Add all Proxmox hosts that aren't already in nodes list
   for host in "${PROXMOX_HOSTS[@]}"; do
-    log_info "Testing connection to Proxmox host: $host"
-    
-    # Skip if host is one of the nodes we already verified
-    local already_verified=false
-    for node in "${NODES[@]}"; do
-      if [[ "$host" == "$node" ]]; then
-        already_verified=true
+    # Check if host is already in our list
+    local already_included=false
+    for existing in "${all_hosts[@]}"; do
+      if [[ "$existing" == "$host" ]]; then
+        already_included=true
         break
       fi
     done
     
-    if [[ "$already_verified" == "true" ]]; then
-      log_info "Host $host already verified as a node"
-      continue
-    fi
-    
-    # Check if we can connect without prompts
-    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" root@$host "echo Connected" &>/dev/null; then
-      log_warn "Cannot connect to $host without prompt, attempting to accept host key..."
-      
-      # Accept and permanently add the host key
-      if [[ "$FORCE" == "true" ]]; then
-        log_info "Force mode enabled, automatically adding host key"
-        add_host_key "$host" "$SSH_PORT"
-      else
-        # Interactive mode
-        log_info "SSH connection requires host key verification for host $host"
-        log_info "To continue non-interactively in the future, use the --force flag"
-        
-        if [[ "$INTERACTIVE" == "true" ]]; then
-          if confirm "Accept and add host key for host $host?"; then
-            add_host_key "$host" "$SSH_PORT"
-          else
-            log_error "Host key verification rejected, cannot continue"
-            return 1
-          fi
-        else
-          log_error "Host key verification required for host $host. Run in interactive mode or use --force"
-          return 1
-        fi
-      fi
-
-      # Verify connection after adding the key
-      local result=0
-      if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" root@$host "echo Connected" &>/dev/null; then
-        log_error "Failed to connect to $host despite adding host key"
-        result=1
-      else
-        log_success "Connection to $host verified after adding host key"
-      fi
-
-      return $result
+    if [[ "$already_included" == "false" ]]; then
+      log_debug "Adding Proxmox host to verification list: $host"
+      all_hosts+=("$host")
     else
-      log_success "Connection to $host verified"
+      log_debug "Proxmox host already in list: $host"
     fi
   done
   
-  log_success "All SSH connections verified"
-  return 0
+  # Check for any node-specific Proxmox hosts that might not be in PROXMOX_HOSTS
+  for node in "${NODES[@]}"; do
+    local proxmox_host=$(yq -r ".node_details.$node.proxmox_host // \"\"" "$CONFIG_FILE")
+    
+    if [[ -n "$proxmox_host" ]]; then
+      # Check if this host is already in our list
+      local already_included=false
+      for existing in "${all_hosts[@]}"; do
+        if [[ "$existing" == "$proxmox_host" ]]; then
+          already_included=true
+          break
+        fi
+      done
+      
+      if [[ "$already_included" == "false" ]]; then
+        log_debug "Adding node-specific Proxmox host to verification list: $proxmox_host"
+        all_hosts+=("$proxmox_host")
+      else
+        log_debug "Node-specific Proxmox host already in list: $proxmox_host"
+      fi
+    fi
+  done
+  
+  log_info "Hosts to verify: ${all_hosts[*]}"
+  
+  # Clear existing host keys if --force is used
+  if [[ "$FORCE" == "true" ]]; then
+    log_info "Force mode enabled, clearing any existing host keys..."
+    
+    for host in "${all_hosts[@]}"; do
+      log_info "Removing any existing host keys for $host..."
+      ssh-keygen -R "$host" >/dev/null 2>&1
+      
+      # Try with IP address if it's a hostname
+      if [[ ! "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        local ip=$(getent hosts "$host" | awk '{print $1}' | head -1)
+        if [[ -n "$ip" ]]; then
+          log_debug "Also removing keys for IP $ip"
+          ssh-keygen -R "$ip" >/dev/null 2>&1
+        fi
+      fi
+      
+      # Try with FQDN if it looks like a short hostname
+      if [[ ! "$host" =~ \. && ! "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        # Try to append domain from /etc/resolv.conf
+        local domain=$(grep "^domain\|^search" /etc/resolv.conf | head -1 | awk '{print $2}')
+        if [[ -n "$domain" ]]; then
+          local fqdn="${host}.${domain}"
+          log_debug "Also removing keys for FQDN $fqdn"
+          ssh-keygen -R "$fqdn" >/dev/null 2>&1
+        fi
+      fi
+    done
+  fi
+
+  # Verify SSH connectivity to all hosts
+  local all_verified=true
+  
+  for host in "${all_hosts[@]}"; do
+    log_info "Verifying SSH connectivity to $host"
+    
+    # Try to connect without prompts
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" root@$host "echo Connected" &>/dev/null; then
+      log_success "SSH connection to $host verified"
+      continue
+    fi
+    
+    log_warn "Cannot connect to $host without prompt, attempting to accept host key..."
+    
+    # Accept and add the host key
+    if [[ "$FORCE" == "true" ]]; then
+      log_info "Force mode enabled, automatically adding host key"
+      if ! add_host_key "$host" "$SSH_PORT"; then
+        log_error "Failed to add host key for $host"
+        all_verified=false
+        continue
+      fi
+    else
+      # Interactive mode
+      log_info "SSH connection requires host key verification for $host"
+      if [[ "$INTERACTIVE" == "true" ]]; then
+        if confirm "Accept and add host key for $host?"; then
+          if ! add_host_key "$host" "$SSH_PORT"; then
+            log_error "Failed to add host key for $host"
+            all_verified=false
+            continue
+          fi
+        else
+          log_error "Host key verification rejected for $host"
+          all_verified=false
+          continue
+        fi
+      else
+        log_error "Host key verification required for $host. Run in interactive mode or use --force"
+        all_verified=false
+        continue
+      fi
+    fi
+    
+    # Verify connection after adding the key
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" root@$host "echo Connected" &>/dev/null; then
+      log_error "Failed to connect to $host despite adding host key"
+      all_verified=false
+    else
+      log_success "Connection to $host verified after adding host key"
+    fi
+  done
+  
+  if [[ "$all_verified" == "true" ]]; then
+    log_success "All SSH connections verified"
+    return 0
+  else
+    log_error "Failed to verify SSH connectivity to all hosts"
+    return 1
+  fi
 }
 
-# Unified SSH command executor with flexible output options
+# Writes debug log to a file
+function ssh_debug_log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') SSH_DEBUG: $1" >> /tmp/ssh_debug.log
+}
+
+# Enhanced SSH command executor with debugging
 function ssh_cmd() {
   # Default values
   local target="$1"
@@ -325,60 +416,105 @@ function ssh_cmd() {
   local hostname=$(hostname -f)
   local short_hostname=$(hostname -s)
   
-  # More detailed debug information
-  log_debug "SSH command details:"
-  log_debug "  Target: $target"
-  log_debug "  User: $user"
-  log_debug "  Mode: $mode"
-  log_debug "  Port: $port"
-  log_debug "  Command: $cmd"
+  # Debug logging
+  ssh_debug_log "============= NEW SSH COMMAND ============="
+  ssh_debug_log "Target: $target"
+  ssh_debug_log "User: $user"
+  ssh_debug_log "Mode: $mode"
+  ssh_debug_log "Port: $port"
+  ssh_debug_log "Command: $cmd"
   
   # Check if target is local host
   if [[ "$target" == "localhost" || "$target" == "127.0.0.1" || "$target" == "$hostname" || "$target" == "$short_hostname" ]]; then
-    log_debug "Executing command locally"
+    ssh_debug_log "Executing command locally"
     
     case "$mode" in
       silent)
+        ssh_debug_log "Mode: silent (suppressing all output)"
         eval "$cmd" &>/dev/null
-        return $?
+        local exit_code=$?
+        ssh_debug_log "Exit code: $exit_code"
+        return $exit_code
         ;;
       quiet)
+        ssh_debug_log "Mode: quiet (suppressing stderr)"
         eval "$cmd" 2>/dev/null
-        return $?
+        local exit_code=$?
+        ssh_debug_log "Exit code: $exit_code"
+        return $exit_code
         ;;
       capture)
-        eval "$cmd" 2>&1
-        return $?
+        ssh_debug_log "Mode: capture (capturing all output)"
+        local output=$(eval "$cmd" 2>&1)
+        local exit_code=$?
+        ssh_debug_log "Exit code: $exit_code"
+        ssh_debug_log "Output: $output"
+        echo "$output"
+        return $exit_code
         ;;
       *)
+        ssh_debug_log "Mode: normal"
         eval "$cmd"
-        return $?
+        local exit_code=$?
+        ssh_debug_log "Exit code: $exit_code"
+        return $exit_code
         ;;
     esac
   else
-    # Additional debug info for SSH connection
-    log_debug "Executing command via SSH to $target:$port as $user"
+    ssh_debug_log "Executing command via SSH to $target"
     
-    # Properly quote and escape the command to prevent shell interpretation issues
-    # Use single quotes to prevent local shell expansion
-    local escaped_cmd=$(printf "%q" "$cmd")
+    # Debug connection
+    ssh_debug_log "Testing connection first..."
+    if ssh -o BatchMode=yes -o ConnectTimeout=2 -p "$port" "$user@$target" "echo TEST_CONNECTION_OK" &>/dev/null; then
+      ssh_debug_log "Connection test successful"
+    else
+      ssh_debug_log "Connection test FAILED"
+    fi
+    
+    # For special commands involving qm, add extra debugging
+    if [[ "$cmd" == "qm "* || "$cmd" == *"qm "* ]]; then
+      ssh_debug_log "IMPORTANT: Detected qm command: $cmd"
+    fi
+    
+    # Construct the SSH command - this is where issues might occur
+    local ssh_full_cmd="ssh -o BatchMode=yes -o ConnectTimeout=10 -p $port $user@$target \"$cmd\""
+    ssh_debug_log "Full SSH command being executed: $ssh_full_cmd"
     
     case "$mode" in
       silent)
-        ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$port" $user@$target "$escaped_cmd" &>/dev/null
-        return $?
+        ssh_debug_log "Mode: silent (suppressing all output)"
+        local output=$(eval "$ssh_full_cmd" 2>&1)
+        local exit_code=$?
+        ssh_debug_log "Exit code: $exit_code"
+        ssh_debug_log "Output (not shown to user): $output"
+        return $exit_code
         ;;
       quiet)
-        ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$port" $user@$target "$escaped_cmd" 2>/dev/null
-        return $?
+        ssh_debug_log "Mode: quiet (suppressing stderr)"
+        local output=$(eval "$ssh_full_cmd" 2>&1)
+        local exit_code=$?
+        ssh_debug_log "Exit code: $exit_code"
+        ssh_debug_log "Output (partially shown to user): $output"
+        echo "$output" | grep -v "^ssh:" | grep -v "^Warning:"
+        return $exit_code
         ;;
       capture)
-        ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$port" $user@$target "$escaped_cmd" 2>&1
-        return $?
+        ssh_debug_log "Mode: capture (capturing all output)"
+        local output=$(eval "$ssh_full_cmd" 2>&1)
+        local exit_code=$?
+        ssh_debug_log "Exit code: $exit_code"
+        ssh_debug_log "Output: $output"
+        echo "$output"
+        return $exit_code
         ;;
       *)
-        ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$port" $user@$target "$escaped_cmd"
-        return $?
+        ssh_debug_log "Mode: normal"
+        local output=$(eval "$ssh_full_cmd" 2>&1)
+        local exit_code=$?
+        ssh_debug_log "Exit code: $exit_code"
+        ssh_debug_log "Output: $output"
+        echo "$output"
+        return $exit_code
         ;;
     esac
   fi

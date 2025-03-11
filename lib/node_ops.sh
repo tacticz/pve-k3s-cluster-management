@@ -429,7 +429,7 @@ function shutdown_node() {
       # Wait for VM to shutdown if requested
       if [[ "$wait_for_shutdown" == "true" ]]; then
         log_info "Waiting for VM $vm_id to shutdown..."
-        local timeout=180
+        local timeout=90
         local count=0
         
         while [[ $count -lt $timeout ]]; do
@@ -449,8 +449,17 @@ function shutdown_node() {
         done
         
         # Final check
-        local final_status=$(qm status $vm_id 2>/dev/null | grep -o "status: [a-z]*" | cut -d' ' -f2)
-        
+        local final_status=$(ssh_cmd_quiet "$proxmox_host" "qm status $vm_id | grep -o \"status: [a-z]*\" | cut -d' ' -f2" "$PROXMOX_USER")
+        log_debug "Final VM status check via ssh_cmd_quiet: '$final_status'"
+
+        # Just for debugging - what happens if we try direct qm on local system
+        local local_qm_exists=$(command -v qm &>/dev/null && echo "exists" || echo "missing")
+        log_debug "Local qm command $local_qm_exists on $(hostname)"
+        if [[ "$local_qm_exists" == "exists" ]]; then
+          local direct_check=$(qm status $vm_id 2>/dev/null | grep -o "status: [a-z]*" | cut -d' ' -f2 || echo "failed")
+          log_debug "Direct local qm status check result: '$direct_check'"
+        fi
+
         if [[ "$final_status" != "stopped" ]]; then
           log_error "Timed out waiting for VM $vm_id to stop (final status: $final_status)"
           
@@ -535,7 +544,7 @@ function start_node() {
     
     # Wait for the node to be reachable
     log_info "Waiting for $node to be reachable..."
-    local timeout=180  # Increase timeout to 3 minutes
+    local timeout=90
     local count=0
     local connection_attempts=0
     local connection_success=false
