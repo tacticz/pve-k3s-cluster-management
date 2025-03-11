@@ -106,61 +106,253 @@ function cordon_node() {
   return 0
 }
 
-# Uncordon a node (mark as schedulable)
-function uncordon_node() {
+# Function to wait for k3s service to be ready on a node
+function wait_for_k3s_ready() {
   local node="$1"
+  local timeout="${2:-120}"  # 2 minute timeout
   
-  log_info "Uncordoning node $node..."
+  log_info "Waiting for k3s service to be active on $node..."
+  local count=0
   
-  # Find a kubectl node that's not the target
-  local kubectl_node=""
-  
-  # First try nodes in the current NODES array
-  for n in "${NODES[@]}"; do
-    if [[ "$n" != "$node" ]]; then
-      kubectl_node="$n"
-      break
+  while [[ $count -lt $timeout ]]; do
+    # Check ONLY k3s service, not k3s-agent
+    local service_status=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service 2>/dev/null || echo 'inactive'" "$PROXMOX_USER")
+    
+    # Trim any whitespace or newlines
+    service_status=$(echo "$service_status" | tr -d '[:space:]')
+    
+    if [[ "$service_status" == "active" ]]; then
+      log_success "K3s service is active on $node"
+      return 0
+    fi
+    
+    sleep 5
+    ((count+=5))
+    log_info "Waiting for k3s service to become active... (${count}s/${timeout}s)"
+    
+    # Every 30 seconds, show more detailed diagnostics
+    if (( count % 30 == 0 )); then
+      log_info "Checking detailed status on $node after ${count}s..."
+      ssh_cmd_quiet "$node" "systemctl status k3s.service | grep 'Active:'" "$PROXMOX_USER"
     fi
   done
   
-  # If no node found in NODES array, try to get a node from the config
-  if [[ -z "$kubectl_node" ]]; then
-    # Get all nodes from config
-    local all_nodes=$(yq -r '.nodes[]' "$CONFIG_FILE" 2>/dev/null)
-    
-    # Find a node that's not the target and is accessible
-    for potential_node in $all_nodes; do
-      if [[ "$potential_node" != "$node" ]]; then
-        if ssh_cmd_quiet "$potential_node" "echo Connected" "$PROXMOX_USER" &>/dev/null; then
-          kubectl_node="$potential_node"
-          log_info "Using $kubectl_node to run kubectl commands"
-          break
-        fi
-      fi
-    done
-  fi
+  # Final check before giving up
+  local final_status=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service 2>/dev/null || echo 'inactive'" "$PROXMOX_USER")
+  final_status=$(echo "$final_status" | tr -d '[:space:]')
   
-  # If still no other node found, use the node itself as last resort
-  if [[ -z "$kubectl_node" ]]; then
-    kubectl_node="$node"
-    log_warn "No other accessible node found, using $node itself for uncordoning"
-  fi
-  
-  # Execute uncordon command
-  if [[ "$DRY_RUN" == "true" ]]; then
-    log_info "[DRY RUN] Would uncordon node $node"
+  if [[ "$final_status" == "active" ]]; then
+    log_success "K3s service is active on $node after final check"
     return 0
   fi
   
-  local result=$(ssh_cmd_capture "$kubectl_node" "kubectl uncordon $node" "$PROXMOX_USER")
-  local exit_code=$?
+  log_warn "Timed out waiting for k3s service to become active on $node"
+  return 1
+}
+
+# Enhanced function to find the best node to run kubectl from
+function find_kubectl_node() {
+  local excluded_node="$1"
+  local all_nodes=("${NODES[@]}")
   
-  if [[ $exit_code -ne 0 ]]; then
-    log_error "Failed to uncordon node $node: $result"
+  # Try to find a node in the current nodes array first
+  for node in "${all_nodes[@]}"; do
+    if [[ "$node" != "$excluded_node" ]]; then
+      if ssh_cmd_silent "$node" "kubectl get nodes" "$PROXMOX_USER"; then
+        echo "$node"
+        return 0
+      fi
+    fi
+  done
+  
+  # If no node found in the current array, try all nodes from config
+  log_info "Looking for any available control plane node to run kubectl..."
+  local config_nodes=$(yq -r '.nodes[]' "$CONFIG_FILE" 2>/dev/null)
+  
+  for node in $config_nodes; do
+    if [[ "$node" != "$excluded_node" ]]; then
+      if ssh_cmd_silent "$node" "kubectl get nodes" "$PROXMOX_USER"; then
+        echo "$node"
+        return 0
+      fi
+    fi
+  done
+  
+  # As a last resort, try the node itself, but only if it's ready
+  if ssh_cmd_silent "$excluded_node" "kubectl get nodes" "$PROXMOX_USER"; then
+    echo "$excluded_node"
+    return 0
+  fi
+  
+  return 1
+}
+
+# Improved uncordon function with better node selection and retry mechanism
+function uncordon_node() {
+  local node="$1"
+  local max_retries="${2:-3}"  # Allow multiple retries
+  local retry_delay="${3:-10}"  # Seconds between retries
+  
+  log_info "Uncordoning node $node (with up to $max_retries retries)..."
+  
+  # Find a kubectl node that's not the target
+  local kubectl_node=$(find_kubectl_node "$node")
+  
+  # If no node found, wait briefly and try again
+  if [[ -z "$kubectl_node" ]]; then
+    log_warn "No node available to run kubectl commands. Waiting 30 seconds before retrying..."
+    sleep 30
+    kubectl_node=$(find_kubectl_node "$node")
+  fi
+  
+  # If still no node found, check if target node is ready to run kubectl itself
+  if [[ -z "$kubectl_node" ]]; then
+    log_info "Waiting for $node to be ready to run kubectl itself..."
+    wait_for_k3s_ready "$node"
+    kubectl_node="$node"
+    log_info "Using $node itself for uncordoning"
+  fi
+  
+  # Execute uncordon command with retries
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[DRY RUN] Would uncordon node $node using $kubectl_node"
+    return 0
+  fi
+  
+  local retry=0
+  local success=false
+  
+  while [[ $retry -lt $max_retries && "$success" != "true" ]]; do
+    if [[ $retry -gt 0 ]]; then
+      log_info "Retry $retry/$max_retries after $retry_delay seconds..."
+      sleep $retry_delay
+    fi
+    
+    log_info "Running uncordon command from $kubectl_node: kubectl uncordon $node"
+    local result=$(ssh_cmd_capture "$kubectl_node" "kubectl uncordon $node" "$PROXMOX_USER")
+    local exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]]; then
+      log_success "Node $node uncordoned successfully"
+      success=true
+      break
+    else
+      log_warn "Attempt $((retry+1)) failed to uncordon node $node: $result"
+      ((retry++))
+      
+      # If we've failed multiple times, check if node status is cordoned
+      # It might have already been uncordoned by another process
+      if [[ $retry -gt 1 ]]; then
+        local is_cordoned=$(ssh_cmd_quiet "$kubectl_node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "$PROXMOX_USER")
+        
+        if [[ "$is_cordoned" != "true" ]]; then
+          log_info "Node $node appears to be already schedulable"
+          success=true
+          break
+        fi
+      fi
+    fi
+  done
+  
+  if [[ "$success" != "true" ]]; then
+    log_error "Failed to uncordon node $node after $max_retries attempts"
     return 1
   fi
   
-  log_success "Node $node uncordoned successfully"
+  return 0
+}
+
+# Enhanced uncordon function with validation and retries
+function uncordon_node_with_validation() {
+  local node="$1"
+  local max_retries="${2:-12}"
+  local initial_delay="${3:-10}"
+  
+  log_info "Uncordoning node $node with validation (max retries: $max_retries)..."
+  
+  # First make sure the node is Ready before attempting to uncordon
+  log_info "Waiting for node $node to be in Ready state before uncordoning..."
+  check_node_ready "$node" 300
+  
+  # Even if node isn't fully ready, proceed with uncordon attempts
+  local retry=0
+  local success=false
+  local backoff=$initial_delay
+  
+  while [[ $retry -lt $max_retries && "$success" != "true" ]]; do
+    if [[ $retry -gt 0 ]]; then
+      log_info "Retry $retry/$max_retries after $backoff seconds delay..."
+      sleep $backoff
+      # Increase backoff for next attempt
+      backoff=$((backoff * 2))
+      if [[ $backoff -gt 120 ]]; then
+        backoff=120
+      fi
+    fi
+    
+    # Find best kubectl node
+    local kubectl_node=""
+    for check_node in "${NODES[@]}"; do
+      if [[ "$check_node" != "$node" ]] && ssh_cmd_silent "$check_node" "kubectl get nodes" "$PROXMOX_USER"; then
+        kubectl_node="$check_node"
+        break
+      fi
+    done
+    
+    if [[ -n "$kubectl_node" ]]; then
+      log_info "Using $kubectl_node to uncordon $node"
+      local cmd_result=$(ssh_cmd_capture "$kubectl_node" "kubectl uncordon $node" "$PROXMOX_USER")
+      local exit_code=$?
+      
+      if [[ $exit_code -eq 0 ]]; then
+        log_success "Node $node uncordon command succeeded"
+        
+        # Verify uncordon was successful
+        sleep 2
+        local is_still_cordoned=$(ssh_cmd_quiet "$kubectl_node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "$PROXMOX_USER")
+        
+        if [[ "$is_still_cordoned" != "true" ]]; then
+          log_success "Node $node successfully uncordoned and verified"
+          success=true
+          break
+        else
+          log_warn "Node $node still appears cordoned despite successful command"
+        fi
+      else
+        log_warn "Attempt $((retry+1)) failed to uncordon node $node: $cmd_result"
+      fi
+    else
+      # Try self-uncordon if no other node available and node is Ready
+      local self_ready=$(ssh_cmd_quiet "$node" "kubectl get node $node -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'" "$PROXMOX_USER")
+      
+      if [[ "$self_ready" == "True" ]]; then
+        log_info "Node $node appears Ready, attempting self-uncordon"
+        if ssh_cmd_silent "$node" "kubectl uncordon $node" "$PROXMOX_USER"; then
+          log_success "Node $node successfully self-uncordoned"
+          
+          # Verify it worked
+          sleep 2
+          local self_check=$(ssh_cmd_quiet "$node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "$PROXMOX_USER")
+          
+          if [[ "$self_check" != "true" ]]; then
+            log_success "Node $node self-uncordon verified"
+            success=true
+            break
+          fi
+        fi
+      else
+        log_info "Node $node not yet Ready for self-uncordon, waiting..."
+      fi
+    fi
+    
+    ((retry++))
+  done
+  
+  if [[ "$success" != "true" ]]; then
+    log_error "Failed to uncordon node $node after $max_retries attempts"
+    return 1
+  fi
+  
   return 0
 }
 
@@ -516,7 +708,7 @@ function shutdown_node() {
   fi
 }
 
-# Start a previously shutdown node
+# Modify the start_node function to add proper waiting for k3s initialization
 function start_node() {
   local node="$1"
   
@@ -544,9 +736,8 @@ function start_node() {
     
     # Wait for the node to be reachable
     log_info "Waiting for $node to be reachable..."
-    local timeout=90
+    local timeout=120
     local count=0
-    local connection_attempts=0
     local connection_success=false
 
     while [[ $count -lt $timeout ]]; do
@@ -580,10 +771,16 @@ function start_node() {
       log_error "Timed out waiting for $node to be reachable"
       return 1
     fi
+    
+    # Now wait for k3s to be fully initialized
+    log_info "Waiting for k3s to initialize on $node..."
+    wait_for_k3s_ready "$node" 180  # Allow 3 minutes for k3s to start up
   else
     log_info "[DRY RUN] Would start VM $vm_id on $proxmox_host"
     return 0
   fi
+  
+  return 0
 }
 
 # Cleanup node after a failed operation

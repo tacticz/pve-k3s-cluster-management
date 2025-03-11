@@ -389,81 +389,32 @@ function snapshot_cluster() {
         log_warn "Continuing despite start failure for master node $node due to --force flag"
       }
       
-      # Wait for node to be ready before processing next master
-      log_info "Waiting for master node $node to be ready..."
-      local ready_node
+      # Wait for service to be active
+      wait_for_k3s_ready "$node" 180
       
-      # Find a running node to check status with
-      for check_node in "${original_nodes[@]}"; do
-        if [[ "$check_node" != "$node" ]]; then
-          if ssh_cmd_quiet "$check_node" "kubectl get nodes" "$PROXMOX_USER" &>/dev/null; then
-            ready_node="$check_node"
-            break
-          fi
-        fi
-      done
+      # Wait a bit for additional initialization 
+      sleep 15
       
-      # If we found a node to check with, wait for the current node to be ready
-      if [[ -n "$ready_node" ]]; then
-        local timeout=120
-        local count=0
-        while [[ $count -lt $timeout ]]; do
-          local node_status=$(ssh_cmd_quiet "$ready_node" "kubectl get node $node -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'" "$PROXMOX_USER")
-          
-          if [[ "$node_status" == "True" ]]; then
-            log_success "Master node $node is now ready"
-            
-            # Uncordon the node now that it's ready
-            log_info "Uncordoning master node $node..."
-
-            log_debug "Finding a node to run kubectl from..."
-            for check_node in "${original_nodes[@]}"; do
-              log_debug "Testing if $check_node can run kubectl..."
-              if ssh_cmd_silent "$check_node" "kubectl get nodes" "$PROXMOX_USER"; then
-                log_debug "Success: $check_node can run kubectl"
-                found_kubectl_node="$check_node"
-                break
-              else
-                log_debug "Failed: $check_node cannot run kubectl"
-              fi
-            done
-
-            if [[ -n "$found_kubectl_node" ]]; then
-              log_debug "Using $found_kubectl_node to check cordon status of $node"
-              local is_cordoned=$(ssh_cmd_quiet "$found_kubectl_node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "$PROXMOX_USER")
-              log_debug "Cordon status for $node: '$is_cordoned'"
-              
-              if [[ "$is_cordoned" == "true" ]]; then
-                log_info "Node $node is cordoned, attempting to uncordon using $found_kubectl_node"
-                uncordon_node "$node"
-              else
-                log_info "Node $node is already schedulable"
-              fi
-            else
-              log_debug "No kubectl-capable node found to check $node"
-            fi
-
-            uncordon_node "$node" || {
-              log_warn "Failed to uncordon node $node. Node may still be cordoned."
-            }
-            
-            break
-          fi
-          
-          sleep 10
-          ((count+=10))
-          log_info "Still waiting for master node $node to be ready... (${count}s/${timeout}s)"
-        done
-        
-        if [[ $count -ge $timeout ]]; then
-          log_warn "Timed out waiting for master node $node to be ready"
-          if [[ "$FORCE" != "true" ]]; then
-            NODES=("${original_nodes[@]}")
-            return 1
-          fi
+      # Uncordon with strict validation before proceeding
+      log_info "Uncordoning master node $node..."
+      if ! uncordon_node_with_validation "$node" 15 10; then
+        if [[ "$FORCE" != "true" ]]; then
+          log_error "Failed to uncordon master node $node. Aborting."
+          NODES=("${original_nodes[@]}")
+          return 1
         fi
-      else
-        log_warn "Could not find a running node to check status of $node"
+        log_warn "Continuing despite uncordon failure for master node $node due to --force flag"
+      fi
+      
+      # Verify cluster health before proceeding to next node
+      log_info "Verifying cluster health after processing $node..."
+      if ! validate_cluster "basic"; then
+        if [[ "$FORCE" != "true" ]]; then
+          log_error "Cluster validation failed after processing $node. Aborting."
+          NODES=("${original_nodes[@]}")
+          return 1
+        fi
+        log_warn "Continuing despite validation failure after processing $node due to --force flag"
       fi
     done
   else
@@ -529,41 +480,58 @@ function snapshot_cluster() {
 
   # Ensure all nodes are uncordoned
   log_info "Ensuring all nodes are uncordoned after snapshot operations..."
+  local uncordon_failures=0
 
   for node in "${original_nodes[@]}"; do
     # Check if node is cordoned
     if [[ "$DRY_RUN" != "true" ]]; then
-      # Find a working node to run kubectl from
-      local kubectl_node=""
-      for check_node in "${original_nodes[@]}"; do
-        if ssh -o BatchMode=yes -o ConnectTimeout=2 "root@$check_node" "kubectl get nodes" &>/dev/null; then
-          kubectl_node="$check_node"
-          break
-        fi
-      done
+      # Use our improved node finder function
+      local kubectl_node=$(find_kubectl_node "$node")
       
       if [[ -n "$kubectl_node" ]]; then
-        # Check if node is cordoned
-        local node_status=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@$kubectl_node "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" 2>/dev/null)
+        log_info "Using $kubectl_node to check cordon status of $node"
         
-        if [[ "$node_status" == "true" ]]; then
-          log_info "Node $node is still cordoned, uncordoning..."
+        # Check if node is cordoned
+        local is_cordoned=$(ssh_cmd_quiet "$kubectl_node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "$PROXMOX_USER")
+        
+        if [[ "$is_cordoned" == "true" ]]; then
+          log_info "Node $node is cordoned, attempting to uncordon..."
           
-          # Use direct SSH command to uncordon
-          local uncordon_cmd="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@$kubectl_node \"kubectl uncordon $node\""
-          local uncordon_output=$(eval "$uncordon_cmd" 2>&1)
-          local uncordon_exit_code=$?
-          
-          if [[ $uncordon_exit_code -eq 0 ]]; then
-            log_success "Node $node uncordoned successfully"
-          else
-            log_warn "Failed to uncordon node $node: $uncordon_output"
+          # Use improved uncordon function with retries
+          if ! uncordon_node "$node" 5 15; then
+            log_warn "Failed to uncordon node $node after multiple attempts"
+            uncordon_failures=$((uncordon_failures+1))
           fi
         else
           log_info "Node $node is already schedulable"
         fi
       else
-        log_warn "Could not find a working node to uncordon $node"
+        log_warn "No working kubectl node found initially, waiting for services to initialize..."
+        
+        # If no kubectl node found, wait and try again with the node itself
+        sleep 15
+        
+        if wait_for_k3s_ready "$node" 90; then
+          log_info "Node $node now has k3s ready, checking if cordoned..."
+          
+          # Check if it's cordoned using the node itself
+          local self_check=$(ssh_cmd_quiet "$node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "$PROXMOX_USER")
+          
+          if [[ "$self_check" == "true" ]]; then
+            log_info "Node $node is cordoned, attempting self-uncordon..."
+            if ssh_cmd_silent "$node" "kubectl uncordon $node" "$PROXMOX_USER"; then
+              log_success "Node $node successfully self-uncordoned"
+            else
+              log_warn "Failed to self-uncordon node $node"
+              uncordon_failures=$((uncordon_failures+1))
+            fi
+          else
+            log_info "Node $node appears to be already schedulable"
+          fi
+        else
+          log_warn "K3s service did not become ready on $node"
+          uncordon_failures=$((uncordon_failures+1))
+        fi
       fi
     else
       log_info "[DRY RUN] Would ensure node $node is uncordoned"
@@ -572,6 +540,10 @@ function snapshot_cluster() {
 
   # Clean up old snapshots based on retention policy
   clean_old_snapshots
+  
+  if [[ $uncordon_failures -gt 0 ]]; then
+    log_warn "$uncordon_failures nodes may still be cordoned. Manual verification recommended."
+  fi
   
   log_success "Cluster snapshots created successfully with name: $snapshot_name"
   return 0

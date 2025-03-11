@@ -116,6 +116,62 @@ function check_nodes_status() {
   return 0
 }
 
+# Check if a node is in Ready state
+function check_node_ready() {
+  local node="$1"
+  local timeout="${2:-300}"  # Default 5 minute timeout
+  local remote_node="$3"  # Optional: another node to run kubectl from
+  
+  log_info "Checking if node $node is in Ready state..."
+  
+  # First make sure k3s service is active
+  check_k3s_service_active "$node" 120 || {
+    log_warn "K3s service not active on $node"
+    return 1
+  }
+  
+  # Now check node readiness state from another node if possible
+  if [[ -z "$remote_node" ]]; then
+    # Try to find another node to run kubectl from
+    for check_node in "${NODES[@]}"; do
+      if [[ "$check_node" != "$node" ]] && ssh_cmd_silent "$check_node" "kubectl get nodes" "$PROXMOX_USER"; then
+        remote_node="$check_node"
+        log_info "Using $remote_node to check $node status"
+        break
+      fi
+    done
+  fi
+  
+  # If no remote node found, try to use the node itself
+  if [[ -z "$remote_node" ]]; then
+    log_info "Using $node itself to check readiness"
+    remote_node="$node"
+  fi
+  
+  local count=0
+  while [[ $count -lt $timeout ]]; do
+    local ready_status=$(ssh_cmd_quiet "$remote_node" "kubectl get node $node -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'" "$PROXMOX_USER")
+    
+    if [[ "$ready_status" == "True" ]]; then
+      log_success "Node $node is in Ready state"
+      return 0
+    fi
+    
+    sleep 10
+    ((count+=10))
+    
+    if (( count % 30 == 0 )); then
+      local node_status=$(ssh_cmd_quiet "$remote_node" "kubectl get node $node" "$PROXMOX_USER")
+      log_info "Current node status after ${count}s: $node_status"
+    fi
+    
+    log_info "Waiting for node $node to be Ready... (${count}s/${timeout}s)"
+  done
+  
+  log_warn "Timed out waiting for node $node to be Ready"
+  return 1
+}
+
 # Check overall cluster health
 function check_cluster_health() {
   log_info "Checking cluster health..."
