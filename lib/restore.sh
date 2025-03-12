@@ -6,10 +6,6 @@
 # - Restoring from etcd snapshots
 # - Restoring from VM backups/snapshots
 # - Coordinating multi-node restores
-#
-# Author: S-tor + claude.ai
-# Date: February 2025
-# Version: 0.1.0
 
 # Restore etcd from snapshot
 function restore_etcd() {
@@ -24,7 +20,7 @@ function restore_etcd() {
   fi
   
   # Check if node is running k3s server (has etcd)
-  local is_server=$(ssh root@$first_node "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" 2>/dev/null)
+local is_server=$(ssh_cmd_quiet "$first_node" "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" "$PROXMOX_USER")
   
   if [[ "$is_server" != "true" ]]; then
     log_error "Node $first_node is not running k3s server, cannot restore etcd"
@@ -32,14 +28,14 @@ function restore_etcd() {
   fi
   
   # Verify snapshot exists
-  local snapshot_exists=$(ssh root@$first_node "ls -la /var/lib/rancher/k3s/server/db/snapshots/$snapshot_name* 2>/dev/null" 2>/dev/null)
+  local snapshot_exists=$(ssh_cmd_quiet "$first_node" "ls -la /var/lib/rancher/k3s/server/db/snapshots/$snapshot_name* 2>/dev/null" "$PROXMOX_USER")
   
   if [[ -z "$snapshot_exists" ]]; then
     log_error "Snapshot $snapshot_name not found on $first_node"
     
     # List available snapshots
     log_info "Available snapshots:"
-    ssh root@$first_node "ls -la /var/lib/rancher/k3s/server/db/snapshots/" 2>/dev/null
+    ssh_cmd_quiet "$first_node" "ls -la /var/lib/rancher/k3s/server/db/snapshots/" "root"
     
     return 1
   fi
@@ -49,31 +45,31 @@ function restore_etcd() {
   
   for node in "${NODES[@]}"; do
     log_info "Stopping k3s on $node..."
-    ssh root@$node "systemctl stop k3s.service k3s-agent.service 2>/dev/null" &>/dev/null
+    ssh_cmd_silent "$node" "systemctl stop k3s.service k3s-agent.service 2>/dev/null" "root"
   done
   
   sleep 5 # Give k3s time to stop
   
   # Check if k3s is stopped on all nodes
   for node in "${NODES[@]}"; do
-    local status=$(ssh root@$node "systemctl is-active k3s.service k3s-agent.service 2>/dev/null" 2>/dev/null)
+    local status=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service k3s-agent.service 2>/dev/null" "$PROXMOX_USER")
     if [[ "$status" == "active" ]]; then
       log_warn "k3s is still running on $node. Attempting to force stop..."
-      ssh root@$node "systemctl stop k3s.service k3s-agent.service 2>/dev/null" &>/dev/null
+      ssh_cmd_silent "$node" "systemctl stop k3s.service k3s-agent.service 2>/dev/null" "root"
       sleep 2
     fi
   done
   
   # Start with a clean data directory on the first node
   log_info "Preparing data directory on $first_node..."
-  ssh root@$first_node "mkdir -p /var/lib/rancher/k3s/server/db/etcd-restore" &>/dev/null
+  ssh_cmd_silent "$first_node" "mkdir -p /var/lib/rancher/k3s/server/db/etcd-restore" "root"
   
   # Restore etcd from snapshot
   log_info "Restoring etcd from snapshot $snapshot_name..."
-  local restore_result=$(ssh root@$first_node "K3S_CLUSTER_INIT=true k3s server \
+  local restore_result=$(ssh_cmd_capture "$first_node" "K3S_CLUSTER_INIT=true k3s server \
     --cluster-reset \
     --cluster-reset-restore-path=/var/lib/rancher/k3s/server/db/snapshots/$snapshot_name \
-    --data-dir=/var/lib/rancher/k3s/server/db/etcd-restore" 2>&1)
+    --data-dir=/var/lib/rancher/k3s/server/db/etcd-restore" "$PROXMOX_USER")
   
   local exit_code=$?
   
@@ -86,14 +82,14 @@ function restore_etcd() {
   
   # Restart k3s with the restored data directory
   log_info "Restarting k3s with restored data..."
-  ssh root@$first_node "systemctl start k3s.service" &>/dev/null
+  ssh_cmd_silent "$first_node" "systemctl start k3s.service" "root"
   
   # Wait for k3s to start
   log_info "Waiting for k3s to start on $first_node..."
-  local timeout=180
+  local timeout=90
   local count=0
   while [[ $count -lt $timeout ]]; do
-    local status=$(ssh root@$first_node "systemctl is-active k3s.service" 2>/dev/null)
+    local status=$(ssh_cmd_quiet "$first_node" "systemctl is-active k3s.service" "$PROXMOX_USER")
     if [[ "$status" == "active" ]]; then
       log_success "k3s started on $first_node"
       break
@@ -113,7 +109,7 @@ function restore_etcd() {
   for node in "${NODES[@]}"; do
     if [[ "$node" != "$first_node" ]]; then
       log_info "Starting k3s on $node..."
-      ssh root@$node "systemctl start k3s.service k3s-agent.service 2>/dev/null" &>/dev/null
+      ssh_cmd_silent "$node" "systemctl start k3s.service k3s-agent.service 2>/dev/null" "root"
     fi
   done
   
@@ -130,7 +126,7 @@ function find_vm_backup() {
   # If backup_name is specified, look for that specific backup
   if [[ -n "$backup_name" ]]; then
     log_info "Looking for backup $backup_name for VM $vm_id..."
-    local backup_file=$(ssh ${PROXMOX_USER}@$proxmox_host "find /var/lib/vz/dump -name \"vzdump-qemu-${vm_id}-*${backup_name}*\" | sort -r | head -1" 2>/dev/null)
+    local backup_file=$(ssh_cmd_quiet "$proxmox_host" "find /var/lib/vz/dump -name \"vzdump-qemu-${vm_id}-*${backup_name}*\" | sort -r | head -1" "$PROXMOX_USER")
     
     if [[ -n "$backup_file" ]]; then
       echo "$backup_file"
@@ -142,7 +138,7 @@ function find_vm_backup() {
   
   # Otherwise, get the most recent backup
   log_info "Looking for most recent backup for VM $vm_id..."
-  local backup_file=$(ssh ${PROXMOX_USER}@$proxmox_host "find /var/lib/vz/dump -name \"vzdump-qemu-${vm_id}-*.vma*\" -o -name \"vzdump-qemu-${vm_id}-*.tgz*\" | sort -r | head -1" 2>/dev/null)
+  local backup_file=$(ssh_cmd_quiet "$proxmox_host" "find /var/lib/vz/dump -name \"vzdump-qemu-${vm_id}-*.vma*\" -o -name \"vzdump-qemu-${vm_id}-*.tgz*\" | sort -r | head -1" "$PROXMOX_USER")
   
   if [[ -n "$backup_file" ]]; then
     echo "$backup_file"
@@ -162,7 +158,7 @@ function find_vm_snapshot() {
   # If snapshot_name is specified, check if it exists
   if [[ -n "$snapshot_name" ]]; then
     log_info "Checking if snapshot $snapshot_name exists for VM $vm_id..."
-    local snapshot_exists=$(ssh ${PROXMOX_USER}@$proxmox_host "qm listsnapshot $vm_id | grep \"^$snapshot_name \"" 2>/dev/null)
+    local snapshot_exists=$(ssh_cmd_quiet "$proxmox_host" "qm listsnapshot $vm_id | grep \"^$snapshot_name \"" "$PROXMOX_USER")
     
     if [[ -n "$snapshot_exists" ]]; then
       echo "$snapshot_name"
@@ -174,7 +170,7 @@ function find_vm_snapshot() {
   
   # Otherwise, get the most recent k3s-backup snapshot
   log_info "Looking for most recent k3s-backup snapshot for VM $vm_id..."
-  local snapshot=$(ssh ${PROXMOX_USER}@$proxmox_host "qm listsnapshot $vm_id | grep -E '^${BACKUP_PREFIX}-[0-9]{8}-[0-9]{6} ' | sort -r | head -1 | awk '{print \$1}'" 2>/dev/null)
+  local snapshot=$(ssh_cmd_quiet "$proxmox_host" "qm listsnapshot $vm_id | grep -E '^${BACKUP_PREFIX}-[0-9]{8}-[0-9]{6} ' | sort -r | head -1 | awk '{print \$1}'" "$PROXMOX_USER")
   
   if [[ -n "$snapshot" ]]; then
     echo "$snapshot"
@@ -194,7 +190,7 @@ function extract_etcd_snapshot_from_backup() {
   log_info "Extracting etcd snapshot info from backup description..."
   
   # Get backup description
-  local description=$(ssh ${PROXMOX_USER}@$proxmox_host "vzdump --list file=\"$backup_file\" | grep 'Description:' | cut -d ':' -f2-" 2>/dev/null)
+  local description=$(ssh_cmd_quiet "$proxmox_host" "vzdump --list file=\"$backup_file\" | grep 'Description:' | cut -d ':' -f2-" "$PROXMOX_USER")
   
   if [[ -z "$description" ]]; then
     log_warn "No description found for backup $backup_file"
@@ -222,7 +218,7 @@ function extract_etcd_snapshot_from_snapshot() {
   log_info "Extracting etcd snapshot info from snapshot description..."
   
   # Get snapshot description
-  local description=$(ssh ${PROXMOX_USER}@$proxmox_host "qm listsnapshot $vm_id | grep \"^$snapshot_name \" | sed 's/^[^ ]* *[^ ]* *//' | grep 'Etcd:'" 2>/dev/null)
+  local description=$(ssh_cmd_quiet "$proxmox_host" "qm listsnapshot $vm_id | grep \"^$snapshot_name \" | sed 's/^[^ ]* *[^ ]* *//' | grep 'Etcd:'" "$PROXMOX_USER")
   
   if [[ -z "$description" ]]; then
     log_warn "No etcd info found in snapshot $snapshot_name description"
@@ -263,11 +259,11 @@ function restore_vm_from_backup() {
   fi
   
   # Check if VM is running
-  local vm_status=$(ssh ${PROXMOX_USER}@$proxmox_host "qm status $vm_id" 2>/dev/null | grep status | awk '{print $2}')
+  local vm_status=$(ssh_cmd_quiet "$proxmox_host" "qm status $vm_id" "$PROXMOX_USER" | grep status | awk '{print $2}')
   
   if [[ "$vm_status" == "running" ]]; then
     log_info "VM $vm_id is running, stopping it first..."
-    ssh ${PROXMOX_USER}@$proxmox_host "qm stop $vm_id" &>/dev/null
+    ssh_cmd_silent "$proxmox_host" "qm stop $vm_id" "$PROXMOX_USER"
     sleep 5
   fi
   
@@ -275,7 +271,7 @@ function restore_vm_from_backup() {
   local restore_cmd="qmrestore $backup_file $vm_id --force"
   log_info "Running restore command: $restore_cmd"
   
-  local restore_result=$(ssh ${PROXMOX_USER}@$proxmox_host "$restore_cmd" 2>&1)
+  local restore_result=$(ssh_cmd_capture "$proxmox_host" "$restore_cmd" "$PROXMOX_USER")
   local exit_code=$?
   
   if [[ $exit_code -ne 0 ]]; then
@@ -309,16 +305,16 @@ function restore_vm_from_snapshot() {
   fi
   
   # Check if VM is running
-  local vm_status=$(ssh ${PROXMOX_USER}@$proxmox_host "qm status $vm_id" 2>/dev/null | grep status | awk '{print $2}')
+  local vm_status=$(ssh_cmd_quiet "$proxmox_host" "qm status $vm_id" "$PROXMOX_USER" | grep status | awk '{print $2}')
   
   if [[ "$vm_status" == "running" ]]; then
     log_info "VM $vm_id is running, stopping it first..."
-    ssh ${PROXMOX_USER}@$proxmox_host "qm stop $vm_id" &>/dev/null
+    ssh_cmd_silent "$proxmox_host" "qm stop $vm_id" "$PROXMOX_USER"
     sleep 5
   fi
   
   # Rollback to snapshot
-  local rollback_result=$(ssh ${PROXMOX_USER}@$proxmox_host "qm rollback $vm_id $snapshot_name" 2>&1)
+  local rollback_result=$(ssh_cmd_capture "$proxmox_host" "qm rollback $vm_id $snapshot_name" "$PROXMOX_USER")
   local exit_code=$?
   
   if [[ $exit_code -ne 0 ]]; then
@@ -400,7 +396,7 @@ function restore_cluster() {
     # Find a node that has this etcd snapshot
     local etcd_node=""
     for node in "${NODES[@]}"; do
-      local snapshot_exists=$(ssh root@$node "ls -la /var/lib/rancher/k3s/server/db/snapshots/$etcd_snapshot* 2>/dev/null" 2>/dev/null)
+      local snapshot_exists=$(ssh_cmd_quiet "$node" "ls -la /var/lib/rancher/k3s/server/db/snapshots/$etcd_snapshot* 2>/dev/null" "$PROXMOX_USER")
       
       if [[ -n "$snapshot_exists" ]]; then
         etcd_node="$node"
@@ -440,7 +436,7 @@ function restore_cluster() {
         
         # Find a node that has this etcd snapshot
         for node in "${NODES[@]}"; do
-          local snapshot_exists=$(ssh root@$node "ls -la /var/lib/rancher/k3s/server/db/snapshots/$etcd_snapshot* 2>/dev/null" 2>/dev/null)
+          local snapshot_exists=$(ssh_cmd_quiet "$node" "ls -la /var/lib/rancher/k3s/server/db/snapshots/$etcd_snapshot* 2>/dev/null" "$PROXMOX_USER")
           
           if [[ -n "$snapshot_exists" ]]; then
             etcd_node="$node"
@@ -514,13 +510,13 @@ function restore_cluster() {
       else
         # Restore VM from backup
         if [[ "$DRY_RUN" != "true" ]]; then
-          restore_vm_from_backup "$node" "$backup_file" || {
+          if ! restore_vm_from_backup "$node" "$backup_file"; then
             if [[ "$FORCE" != "true" ]]; then
               log_error "Failed to restore VM for node $node. Aborting."
               continue
-            }
+            fi
             log_warn "Continuing despite VM restoration failure due to --force flag"
-          }
+          fi
         else
           log_info "[DRY RUN] Would restore VM $vm_id from backup $backup_file"
         fi
@@ -545,13 +541,13 @@ function restore_cluster() {
       else
         # Restore VM from snapshot
         if [[ "$DRY_RUN" != "true" ]]; then
-          restore_vm_from_snapshot "$node" "$snapshot_name" || {
+          if ! restore_vm_from_snapshot "$node" "$snapshot_name"; then
             if [[ "$FORCE" != "true" ]]; then
               log_error "Failed to restore VM for node $node. Aborting."
               continue
-            }
+            fi
             log_warn "Continuing despite VM restoration failure due to --force flag"
-          }
+          fi
         else
           log_info "[DRY RUN] Would restore VM $vm_id to snapshot $snapshot_name"
         fi
@@ -574,7 +570,7 @@ function restore_cluster() {
     fi
     
     if [[ "$DRY_RUN" != "true" ]]; then
-      ssh ${PROXMOX_USER}@$proxmox_host "qm start $vm_id" &>/dev/null
+      ssh_cmd_silent "$proxmox_host" "qm start $vm_id" "$PROXMOX_USER"
     else
       log_info "[DRY RUN] Would start VM $vm_id"
     fi
@@ -671,11 +667,11 @@ function run_restore_wizard() {
       
       # List backups
       echo "Available backups:"
-      ssh ${PROXMOX_USER}@$proxmox_host "find /var/lib/vz/dump -name \"vzdump-qemu-${vm_id}-*.vma*\" -o -name \"vzdump-qemu-${vm_id}-*.tgz*\" | sort -r | head -5" 2>/dev/null
+      ssh_cmd_quiet "$proxmox_host" "find /var/lib/vz/dump -name \"vzdump-qemu-${vm_id}-*.vma*\" -o -name \"vzdump-qemu-${vm_id}-*.tgz*\" | sort -r | head -5" "$PROXMOX_USER"
       
       # List snapshots
       echo "Available snapshots:"
-      ssh ${PROXMOX_USER}@$proxmox_host "qm listsnapshot $vm_id | grep -E '^${BACKUP_PREFIX}-[0-9]{8}-[0-9]{6} '" 2>/dev/null
+      ssh_cmd_quiet "$proxmox_host" "qm listsnapshot $vm_id | grep -E '^${BACKUP_PREFIX}-[0-9]{8}-[0-9]{6} '" "$PROXMOX_USER"
       
       read -p "Enter backup/snapshot name to restore: " restore_point
       
@@ -710,10 +706,10 @@ function run_restore_wizard() {
       
       # List available backups and snapshots for this node
       echo "Available backups for $selected_node:"
-      ssh ${PROXMOX_USER}@$proxmox_host "find /var/lib/vz/dump -name \"vzdump-qemu-${vm_id}-*.vma*\" -o -name \"vzdump-qemu-${vm_id}-*.tgz*\" | sort -r | head -5" 2>/dev/null
+      ssh_cmd_quiet "$proxmox_host" "find /var/lib/vz/dump -name \"vzdump-qemu-${vm_id}-*.vma*\" -o -name \"vzdump-qemu-${vm_id}-*.tgz*\" | sort -r | head -5" "$PROXMOX_USER"
       
       echo "Available snapshots for $selected_node:"
-      ssh ${PROXMOX_USER}@$proxmox_host "qm listsnapshot $vm_id | grep -E '^${BACKUP_PREFIX}-[0-9]{8}-[0-9]{6} '" 2>/dev/null
+      ssh_cmd_quiet "$proxmox_host" "qm listsnapshot $vm_id | grep -E '^${BACKUP_PREFIX}-[0-9]{8}-[0-9]{6} '" "$PROXMOX_USER"
       
       read -p "Restore from backup (b) or snapshot (s)? " restore_from
       
@@ -733,7 +729,7 @@ function run_restore_wizard() {
         
         # Start VM
         log_info "Starting VM..."
-        ssh ${PROXMOX_USER}@$proxmox_host "qm start $vm_id" &>/dev/null
+        ssh_cmd_silent "$proxmox_host" "qm start $vm_id" "$PROXMOX_USER"
         
       elif [[ "$restore_from" == "s" ]]; then
         read -p "Enter snapshot name or leave empty for most recent: " snapshot_name
@@ -751,7 +747,7 @@ function run_restore_wizard() {
         
         # Start VM
         log_info "Starting VM..."
-        ssh ${PROXMOX_USER}@$proxmox_host "qm start $vm_id" &>/dev/null
+        ssh_cmd_silent "$proxmox_host" "qm start $vm_id" "$PROXMOX_USER"
         
       else
         log_error "Invalid option: $restore_from"
@@ -760,7 +756,7 @@ function run_restore_wizard() {
       
       # Wait for node to be online
       log_info "Waiting for node $selected_node to come online..."
-      local timeout=180
+      local timeout=120
       local count=0
       while [[ $count -lt $timeout ]]; do
         if ssh -o BatchMode=yes -o ConnectTimeout=5 root@$selected_node "echo 'OK'" &>/dev/null; then
@@ -787,7 +783,7 @@ function run_restore_wizard() {
       local control_node=""
       
       for node in "${NODES[@]}"; do
-        local is_server=$(ssh root@$node "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" 2>/dev/null)
+        local is_server=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service >/dev/null 2>&1 && echo 'true' || echo 'false'" "$PROXMOX_USER")
         
         if [[ "$is_server" == "true" ]]; then
           control_node="$node"
@@ -802,7 +798,7 @@ function run_restore_wizard() {
       
       # List etcd snapshots
       echo "Available etcd snapshots on $control_node:"
-      ssh root@$control_node "ls -la /var/lib/rancher/k3s/server/db/snapshots/" 2>/dev/null
+      ssh_cmd_quiet "$control_node" "ls -la /var/lib/rancher/k3s/server/db/snapshots/" "root"
       
       read -p "Enter etcd snapshot name to restore: " etcd_snapshot
       
