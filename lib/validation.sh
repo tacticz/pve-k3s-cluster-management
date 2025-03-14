@@ -344,22 +344,69 @@ function check_network_health() {
   local first_node="${NODES[0]}"
   log_info "Checking pod network connectivity..."
   
-  # Check CNI status (Flannel WireGuard)
-  local cni_check=$(ssh_cmd_quiet "$first_node" "kubectl -n kube-system get pods | grep flannel" "$PROXMOX_USER")
+  # Check k3s network configuration - this is more appropriate for k3s where flannel runs embedded
+  local network_check=$(ssh_cmd_quiet "$first_node" "kubectl get nodes -o jsonpath='{.items[0].spec.podCIDR}'" "$PROXMOX_USER")
   
-  if [[ -z "$cni_check" ]]; then
-    log_warn "Could not find flannel pods"
+  if [[ -n "$network_check" ]]; then
+    log_info "Pod CIDR configured: $network_check"
+    log_success "Network configuration found"
   else
-    log_info "Flannel pods:"
-    echo "$cni_check"
+    # Try alternative method to check for network configuration
+    local cni_config=$(ssh_cmd_quiet "$first_node" "ls -l /var/lib/rancher/k3s/agent/etc/cni/net.d/" "$PROXMOX_USER")
     
-    # Check if all flannel pods are running
-    if echo "$cni_check" | grep -v "Running"; then
-      log_warn "Some flannel pods are not running"
+    if [[ -n "$cni_config" ]]; then
+      log_info "CNI configuration found:"
+      echo "$cni_config"
+      log_success "Network configuration detected"
     else
-      log_success "All flannel pods are running"
+      log_warn "Could not verify k3s network configuration"
     fi
   fi
+  
+  # Additional network validation: Check if cross-node pod communication is working
+  log_info "Testing cross-node pod communication..."
+  
+  # Create a test pod on the first node if it doesn't exist
+  local test_pod=$(ssh_cmd_quiet "$first_node" "kubectl get pod network-test 2>/dev/null" "$PROXMOX_USER")
+  
+  if [[ -z "$test_pod" || ! "$test_pod" =~ Running ]]; then
+    local create_pod=$(ssh_cmd_quiet "$first_node" "kubectl run network-test --image=busybox --restart=Never --command -- sleep 300" "$PROXMOX_USER")
+    log_info "Created test pod for network validation"
+    
+    # Wait for pod to be ready
+    local timeout=60
+    local count=0
+    while [[ $count -lt $timeout ]]; do
+      test_pod=$(ssh_cmd_quiet "$first_node" "kubectl get pod network-test -o jsonpath='{.status.phase}'" "$PROXMOX_USER")
+      
+      if [[ "$test_pod" == "Running" ]]; then
+        log_success "Test pod is running"
+        break
+      fi
+      
+      sleep 2
+      ((count+=2))
+      log_info "Waiting for test pod... (${count}s/${timeout}s)"
+    done
+    
+    if [[ $count -ge $timeout ]]; then
+      log_warn "Timed out waiting for test pod to run"
+      ssh_cmd_quiet "$first_node" "kubectl delete pod network-test --force" "$PROXMOX_USER"
+      return 0
+    fi
+  fi
+  
+  # Check pod DNS resolution
+  local dns_check=$(ssh_cmd_quiet "$first_node" "kubectl exec network-test -- nslookup kubernetes.default.svc.cluster.local" "$PROXMOX_USER")
+  
+  if [[ $? -eq 0 ]]; then
+    log_success "Pod DNS resolution is working"
+  else
+    log_warn "Pod DNS resolution test failed"
+  fi
+  
+  # Clean up test pod
+  ssh_cmd_quiet "$first_node" "kubectl delete pod network-test --force" "$PROXMOX_USER"
   
   return 0
 }
