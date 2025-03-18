@@ -210,15 +210,6 @@ function backup_cluster() {
 function snapshot_cluster() {
   log_section "Creating Cluster Snapshots"
   
-  # Validate cluster before snapshot
-  validate_cluster || {
-    if [[ "$FORCE" != "true" ]]; then
-      log_error "Cluster validation failed. Use --force to snapshot anyway."
-      return 1
-    fi
-    log_warn "Continuing snapshot creation despite validation failure due to --force flag"
-  }
-  
   # Asking about snapshotting the entire cluster is handled in run_interactive_mode
   local snapshot_all_nodes=true
   
@@ -230,7 +221,18 @@ function snapshot_cluster() {
     original_nodes=("${NODES[@]}")
   fi
   
+  # Validate cluster before snapshot (only once at the beginning)
+  log_subsection "Pre-Snapshot Validation"
+  validate_cluster || {
+    if [[ "$FORCE" != "true" ]]; then
+      log_error "Cluster validation failed. Use --force to snapshot anyway."
+      return 1
+    fi
+    log_warn "Continuing snapshot creation despite validation failure due to --force flag"
+  }
+  
   # Ask for snapshot name or use default
+  log_subsection "Snapshot Configuration"
   local snapshot_specific_name="auto"
   local custom_description=""
   local snapshot_name="untitled"
@@ -279,6 +281,7 @@ function snapshot_cluster() {
   log_info "Creating snapshot with name: $snapshot_name"
   
   # Create etcd snapshot first
+  log_subsection "Creating etcd Snapshot"
   create_etcd_snapshot "$etcd_snapshot_name" || {
     if [[ "$FORCE" != "true" ]]; then
       log_error "Failed to create etcd snapshot. Use --force to continue anyway."
@@ -311,9 +314,11 @@ function snapshot_cluster() {
   
   # Process worker nodes first
   if [[ ${#worker_nodes[@]} -gt 0 ]]; then
+    log_subsection "Processing Worker Nodes"
     NODES=("${worker_nodes[@]}")
     
     # Shutdown worker nodes
+    log_info "Shutting down worker nodes..."
     shutdown_node "true" || {
       if [[ "$FORCE" != "true" ]]; then
         log_error "Failed to shutdown worker nodes. Aborting."
@@ -324,7 +329,9 @@ function snapshot_cluster() {
     }
     
     # Create snapshots for worker nodes
+    log_operation_step "Creating Snapshots" "worker nodes"
     for node in "${worker_nodes[@]}"; do
+      log_info "Creating snapshot for worker node $node..."
       create_vm_snapshot "$node" "$snapshot_name" "$etcd_snapshot_name" "$custom_description" || {
         if [[ "$FORCE" != "true" ]]; then
           log_error "Failed to create snapshot for worker node $node. Aborting."
@@ -336,7 +343,9 @@ function snapshot_cluster() {
     done
     
     # Start worker nodes
+    log_operation_step "Starting" "worker nodes"
     for node in "${worker_nodes[@]}"; do
+      log_info "Starting worker node $node..."
       start_node "$node" || {
         if [[ "$FORCE" != "true" ]]; then
           log_error "Failed to start worker node $node. Aborting."
@@ -352,6 +361,7 @@ function snapshot_cluster() {
   
   # Process master nodes one at a time
   if [[ ${#master_nodes[@]} -gt 0 ]]; then
+    log_subsection "Processing Master Nodes"
     for node in "${master_nodes[@]}"; do
       log_info "Processing master node $node..."
       
@@ -359,6 +369,7 @@ function snapshot_cluster() {
       NODES=("$node")
       
       # Shutdown this master node
+      log_operation_step "Shutting Down" "master node $node"
       shutdown_node "true" || {
         if [[ "$FORCE" != "true" ]]; then
           log_error "Failed to shutdown master node $node. Performing cleanup..."
@@ -370,6 +381,7 @@ function snapshot_cluster() {
       }
       
       # Create snapshot for this master node
+      log_operation_step "Creating Snapshot" "master node $node"
       create_vm_snapshot "$node" "$snapshot_name" "$etcd_snapshot_name" "$custom_description" || {
         if [[ "$FORCE" != "true" ]]; then
           log_error "Failed to create snapshot for master node $node. Aborting."
@@ -380,6 +392,7 @@ function snapshot_cluster() {
       }
       
       # Start this master node
+      log_operation_step "Starting" "master node $node"
       start_node "$node" || {
         if [[ "$FORCE" != "true" ]]; then
           log_error "Failed to start master node $node. Aborting."
@@ -389,14 +402,16 @@ function snapshot_cluster() {
         log_warn "Continuing despite start failure for master node $node due to --force flag"
       }
       
-      # Wait for service to be active
+      # Wait for node initialization
+      log_operation_step "Initializing" "master node $node"
+      log_info "Waiting for k3s to initialize on $node..."
       wait_for_k3s_ready "$node" 180
       
       # Wait a bit for additional initialization 
       sleep 15
       
       # Uncordon with strict validation before proceeding
-      log_info "Uncordoning master node $node..."
+      log_operation_step "Uncordoning" "master node $node"
       if ! uncordon_node_with_validation "$node" 15 10; then
         if [[ "$FORCE" != "true" ]]; then
           log_error "Failed to uncordon master node $node. Aborting."
@@ -406,8 +421,8 @@ function snapshot_cluster() {
         log_warn "Continuing despite uncordon failure for master node $node due to --force flag"
       fi
       
-      # Verify cluster health before proceeding to next node
-      log_info "Verifying cluster health after processing $node..."
+      # Validate this node is healthy before continuing to next node
+      log_operation_step "Validating" "node $node before continuing"
       if ! validate_cluster "basic"; then
         if [[ "$FORCE" != "true" ]]; then
           log_error "Cluster validation failed after processing $node. Aborting."
@@ -424,62 +439,21 @@ function snapshot_cluster() {
   # Restore original nodes array
   NODES=("${original_nodes[@]}")
   
-  # Verify cluster health after all snapshots
-  log_info "Verifying cluster health after all snapshots..."
-  validate_cluster || {
-    log_warn "Cluster validation after snapshots showed issues. Check cluster state."
-  }
-
-  # Directly uncordon the node if needed
-  for node in "${NODES[@]}"; do
-    log_info "Ensuring node $node is uncordoned after snapshot..."
-    
-    # Find any node other than the one we're checking
-    local kubectl_node=""
-    for potential_node in "${original_nodes[@]}"; do
-      if [[ "$potential_node" != "$node" ]]; then
-        # Test if this node is accessible
-        if ssh_cmd_silent "$potential_node" "ls /usr/local/bin/kubectl || ls /var/lib/rancher/k3s/bin/kubectl" "root"; then
-          kubectl_node="$potential_node"
-          log_info "Found accessible node $kubectl_node to run kubectl"
-          break
-        fi
-      fi
-    done
-    
-    if [[ -n "$kubectl_node" ]]; then
-      # Check if node is cordoned
-      log_info "Checking if node $node is cordoned..."
-      local is_cordoned=$(ssh_cmd_quiet "$kubectl_node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "root")
-      
-      if [[ "$is_cordoned" == "true" ]]; then
-        log_info "Node $node is cordoned, uncordoning it..."
-        ssh_cmd "$kubectl_node" "kubectl uncordon $node" "root"
-        sleep 2
-        
-        # Verify uncordon was successful
-        local still_cordoned=$(ssh_cmd_quiet "$kubectl_node" "kubectl get node $node -o jsonpath='{.spec.unschedulable}'" "root")
-        if [[ "$still_cordoned" == "true" ]]; then
-          log_warn "Node $node is still cordoned after uncordon attempt"
-        else
-          log_success "Node $node successfully uncordoned"
-        fi
-      else
-        log_info "Node $node is already schedulable"
-      fi
-    else
-      # As a last resort, try to uncordon from the node itself
-      log_info "No other node available, trying to uncordon from node itself..."
-      if ssh_cmd_silent "$node" "kubectl uncordon $node" "root"; then
-        log_success "Node $node successfully self-uncordoned"
-      else
-        log_warn "Failed to uncordon node $node"
-      fi
-    fi
-  done
+  # Final verification and cleanup
+  log_subsection "Post-Snapshot Verification and Cleanup"
+  
+  # Only run final validation if we processed more than one node
+  # (to avoid redundant validation with the per-node validation above)
+  if [[ ${#original_nodes[@]} -gt 1 ]]; then
+    # Verify cluster health after all snapshots
+    log_operation_step "Final Cluster Validation" "after all snapshots"
+    validate_cluster || {
+      log_warn "Cluster validation after snapshots showed issues. Check cluster state."
+    }
+  fi
 
   # Ensure all nodes are uncordoned
-  log_info "Ensuring all nodes are uncordoned after snapshot operations..."
+  log_operation_step "Ensuring Uncordoned Nodes" "after snapshot operations"
   local uncordon_failures=0
 
   for node in "${original_nodes[@]}"; do
@@ -539,6 +513,7 @@ function snapshot_cluster() {
   done
 
   # Clean up old snapshots based on retention policy
+  log_operation_step "Cleaning Up Old Snapshots" "based on retention policy"
   clean_old_snapshots
   
   if [[ $uncordon_failures -gt 0 ]]; then
