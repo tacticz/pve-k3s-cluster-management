@@ -735,8 +735,9 @@ function start_node() {
     log_success "VM $vm_id started successfully"
     
     # Wait for the node to be reachable
-    log_info "Waiting for $node to be reachable..."
     local timeout=120
+    log_wait_sequence "$node to be reachable" "$timeout"
+    
     local count=0
     local connection_success=false
 
@@ -773,7 +774,7 @@ function start_node() {
     fi
     
     # Now wait for k3s to be fully initialized
-    log_info "Waiting for k3s to initialize on $node..."
+    log_wait_sequence "k3s to initialize on $node" "180"
     wait_for_k3s_ready "$node" 180  # Allow 3 minutes for k3s to start up
   else
     log_info "[DRY RUN] Would start VM $vm_id on $proxmox_host"

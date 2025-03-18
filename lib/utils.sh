@@ -112,6 +112,45 @@ function log_section() {
   fi
 }
 
+# Print subsection header (smaller than section header)
+function log_subsection() {
+  local subsection_name=$1
+  local divider=$(printf '%*s' 40 | tr ' ' '-')
+  echo -e "\n${divider}"
+  echo -e "${CYAN}${subsection_name}${NC}"
+  echo -e "${divider}"
+  
+  if [[ -n "$LOG_FILE" ]]; then
+    echo -e "\n${divider}" >> "$LOG_FILE"
+    echo -e "${subsection_name}" >> "$LOG_FILE"
+    echo -e "${divider}" >> "$LOG_FILE"
+  fi
+}
+
+# Print operation step (for major steps within a subsection)
+function log_operation_step() {
+  local operation=$1
+  local target=$2
+  
+  echo -e "\n${YELLOW}▶ ${operation}${NC} ${target}"
+  
+  if [[ -n "$LOG_FILE" ]]; then
+    echo -e "\n▶ ${operation} ${target}" >> "$LOG_FILE"
+  fi
+}
+
+# Print wait sequence start
+function log_wait_sequence() {
+  local wait_for=$1
+  local timeout=$2
+  
+  echo -e "\n${BLUE}⧖ Waiting for${NC} ${wait_for} ${BLUE}(timeout: ${timeout}s)${NC}"
+  
+  if [[ -n "$LOG_FILE" ]]; then
+    echo -e "\n⧖ Waiting for ${wait_for} (timeout: ${timeout}s)" >> "$LOG_FILE"
+  fi
+}
+
 # Confirm action with user
 function confirm() {
   local message=$1
@@ -726,6 +765,8 @@ function run_interactive_mode() {
     
     5)
       # Interactive snapshot
+      log_section "Snapshot Configuration"
+      
       if confirm "Create snapshot of the entire cluster?" "y"; then
         # All nodes will be snapshotted
         read -p "Enter retention count (leave empty for default: $DEFAULT_RETENTION_COUNT): " retention
@@ -737,6 +778,7 @@ function run_interactive_mode() {
         snapshot_cluster
       else
         # Select specific nodes to snapshot
+        log_subsection "Node Selection"
         echo "Available nodes:"
         for i in "${!NODES[@]}"; do
           echo "$((i+1)). ${NODES[$i]}"
@@ -781,7 +823,7 @@ function run_interactive_mode() {
         fi
         
         # Capture the return value of snapshot_cluster
-        snapshot_cluster
+        snapshot_cluster "from_interactive"
         local snapshot_result=$?
         
         # Restore original nodes array

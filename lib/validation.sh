@@ -122,13 +122,13 @@ function check_node_ready() {
   local timeout="${2:-300}"  # Default 5 minute timeout
   local remote_node="$3"  # Optional: another node to run kubectl from
   
-  log_info "Checking if node $node is in Ready state..."
+  log_wait_sequence "node $node to be in Ready state" "$timeout"
   
   # First make sure k3s service is active
-  check_k3s_service_active "$node" 120 || {
+  if ! systemctl_is_active "$node" "k3s.service" 120; then
     log_warn "K3s service not active on $node"
     return 1
-  }
+  fi
   
   # Now check node readiness state from another node if possible
   if [[ -z "$remote_node" ]]; then
@@ -169,6 +169,34 @@ function check_node_ready() {
   done
   
   log_warn "Timed out waiting for node $node to be Ready"
+  return 1
+}
+
+# Helper function to check if a systemd service is active
+function systemctl_is_active() {
+  local node="$1"
+  local service="$2"
+  local timeout="${3:-60}"
+  
+  log_info "Checking if $service is active on $node..."
+  local count=0
+  
+  while [[ $count -lt $timeout ]]; do
+    local status=$(ssh_cmd_quiet "$node" "systemctl is-active $service 2>/dev/null || echo 'inactive'" "$PROXMOX_USER")
+    status=$(echo "$status" | tr -d '[:space:]')
+    
+    if [[ "$status" == "active" ]]; then
+      log_success "$service is active on $node"
+      return 0
+    fi
+    
+    sleep 5
+    ((count+=5))
+    
+    log_info "Waiting for $service to be active... (${count}s/${timeout}s)"
+  done
+  
+  log_warn "$service is not active on $node after ${timeout}s"
   return 1
 }
 
