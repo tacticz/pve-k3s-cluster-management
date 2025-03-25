@@ -756,7 +756,7 @@ function run_restore_wizard() {
       
       # Wait for node to be online
       log_info "Waiting for node $selected_node to come online..."
-      local timeout=120
+      local timeout=180
       local count=0
       while [[ $count -lt $timeout ]]; do
         if ssh -o BatchMode=yes -o ConnectTimeout=5 root@$selected_node "echo 'OK'" &>/dev/null; then
