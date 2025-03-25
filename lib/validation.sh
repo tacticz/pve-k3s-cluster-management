@@ -125,7 +125,7 @@ function check_node_ready() {
   log_wait_sequence "node $node to be in Ready state" "$timeout"
   
   # First make sure k3s service is active
-  if ! systemctl_is_active "$node" "k3s.service" 120; then
+  if ! systemctl_is_active "$node" "k3s.service" 180; then
     log_warn "K3s service not active on $node"
     return 1
   fi

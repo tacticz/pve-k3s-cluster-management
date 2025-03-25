@@ -111,174 +111,364 @@ function create_etcd_snapshot() {
   return 0
 }
 
-# Create backups of all VMs in the cluster
-function backup_cluster() {
-  log_section "Backing up Cluster"
+# Helper function to create VM snapshot
+function create_vm_snapshot() {
+  local node="$1"
+  local snapshot_name="$2"
+  local etcd_snapshot_name="$3"
+  local custom_description="$4"
   
-  # Validate cluster before backup
-  validate_cluster || {
-    if [[ "$FORCE" != "true" ]]; then
-      log_error "Cluster validation failed. Use --force to backup anyway."
-      return 1
-    fi
-    log_warn "Continuing backup despite validation failure due to --force flag"
-  }
+  # Get node details from config
+  local vm_id=$(yq -r ".node_details.$node.proxmox_vmid // \"\"" "$CONFIG_FILE")
+  local proxmox_host=$(yq -r ".node_details.$node.proxmox_host // \"\"" "$CONFIG_FILE")
   
-  # Create etcd snapshot first
-  local etcd_snapshot_name="${BACKUP_NAME}-etcd"
-  create_etcd_snapshot "$etcd_snapshot_name" || {
-    if [[ "$FORCE" != "true" ]]; then
-      log_error "Failed to create etcd snapshot. Use --force to continue anyway."
-      return 1
-    fi
-    log_warn "Continuing backup despite etcd snapshot failure due to --force flag"
-  }
+  if [[ -z "$vm_id" || -z "$proxmox_host" ]]; then
+    log_error "Could not find VM ID or Proxmox host for node $node in config"
+    return 1
+  fi
   
-  # Get VM IDs and Proxmox hosts for each node
-  declare -A node_vms
-  declare -A node_hosts
+  log_info "Creating snapshot for VM $vm_id on $proxmox_host..."
   
-  for node in "${NODES[@]}"; do
-    local vm_id=$(yq -r ".node_details.$node.proxmox_vmid // \"\"" "$CONFIG_FILE")
-    local proxmox_host=$(yq -r ".node_details.$node.proxmox_host // \"\"" "$CONFIG_FILE")
-    
-    if [[ -z "$vm_id" || -z "$proxmox_host" ]]; then
-      log_error "Could not find VM ID or Proxmox host for node $node in config"
-      if [[ "$FORCE" != "true" ]]; then
-        return 1
-      fi
-      continue
-    fi
-    
-    node_vms[$node]="$vm_id"
-    node_hosts[$node]="$proxmox_host"
-  done
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[DRY RUN] Would create snapshot for VM $vm_id"
+    return 0
+  fi
   
-  # Backup each node's VM
-  for node in "${NODES[@]}"; do
-    local vm_id="${node_vms[$node]}"
-    local proxmox_host="${node_hosts[$node]}"
-    
-    if [[ -z "$vm_id" || -z "$proxmox_host" ]]; then
-      continue
-    fi
-    
-    log_info "Backing up VM for node $node (VM ID: $vm_id on $proxmox_host)..."
-    
-    if [[ "$DRY_RUN" == "true" ]]; then
-      log_info "[DRY RUN] Would backup VM $vm_id on $proxmox_host"
-      continue
-    fi
-    
-    # Create backup
-    local backup_cmd="vzdump $vm_id --compress --mode snapshot"
-    
-    local backup_storage=$(yq -r ".backup.storage // \"\"" "$CONFIG_FILE")
-    if [[ -z "$backup_storage" ]]; then
-      log_warn "No backup storage specified in config. Using default Proxmox storage."
-      backup_storage="$PROXMOX_STORAGE"
-    fi
+  # Create VM snapshot
+  local snapshot_desc="K3s cluster snapshot - Node: $node - Etcd: $etcd_snapshot_name"
+  
+  # Add custom description if provided
+  if [[ -n "$custom_description" ]]; then
+    snapshot_desc="${snapshot_desc} - ${custom_description}"
+  fi
+  
+  local snapshot_cmd="qm snapshot $vm_id \"$snapshot_name\" --description \"$snapshot_desc\""
+  
+  log_info "Running snapshot command: $snapshot_cmd"
+  local snapshot_result=$(ssh_cmd_capture "$proxmox_host" "$snapshot_cmd" "$PROXMOX_USER")
+  local exit_code=$?
+  
+  if [[ $exit_code -ne 0 ]]; then
+    log_error "Failed to create snapshot for VM $vm_id: $snapshot_result"
+    return 1
+  fi
 
-    if [[ -n "$backup_storage" ]]; then
-      backup_cmd="$backup_cmd --storage $backup_storage"
-    fi
-    
-    backup_cmd="$backup_cmd --description \"K3s cluster backup - Node: $node - Timestamp: $TIMESTAMP - Etcd: $etcd_snapshot_name\""
-    
-    log_info "Running backup command: $backup_cmd"
-    local backup_result=$(ssh_cmd_capture "$proxmox_host" "$backup_cmd" "$PROXMOX_USER")
-    local exit_code=$?
-    
-    if [[ $exit_code -ne 0 ]]; then
-      log_error "Failed to backup VM $vm_id: $backup_result"
-      if [[ "$FORCE" != "true" ]]; then
-        return 1
-      fi
-    else
-      log_success "VM $vm_id backup completed successfully"
-    fi
-  done
+  # Verify snapshot was created
+  local snapshot_check=$(ssh_cmd_capture "$proxmox_host" "qm listsnapshot $vm_id | grep -w \"$snapshot_name\"" "$PROXMOX_USER")
+  if [[ -z "$snapshot_check" ]]; then
+    log_error "Snapshot command appeared to succeed but snapshot '$snapshot_name' not found"
+    return 1
+  fi
   
-  # Clean up old backups based on retention policy
-  clean_old_backups
-  
-  log_success "Cluster backup completed successfully"
+  log_success "Snapshot for VM $vm_id created successfully"
   return 0
 }
 
-# Create snapshots of all VMs in the cluster
-function snapshot_cluster() {
-  log_section "Creating Cluster Snapshots"
+# Helper function to get the appropriate storage for backups
+function get_backup_storage() {
+  # First check if backup storage is defined in config
+  local backup_storage=$(yq -r ".backup.storage // \"\"" "$CONFIG_FILE")
   
-  # Asking about snapshotting the entire cluster is handled in run_interactive_mode
-  local snapshot_all_nodes=true
+  # If not defined, try to discover a suitable backup storage
+  if [[ -z "$backup_storage" ]]; then
+    log_warn "No backup storage specified in config. Attempting to auto-detect..."
+    
+    # Try to get storage information from a Proxmox host
+    if [[ ${#PROXMOX_HOSTS[@]} -gt 0 ]]; then
+      local host="${PROXMOX_HOSTS[0]}"
+      
+      # Use pvesh to get detailed storage information
+      local storage_json=$(ssh_cmd_quiet "$host" "pvesh get /storage --output-format json" "$PROXMOX_USER")
+      
+      if [[ -n "$storage_json" ]]; then
+        # Look for storage with backup in content
+        local backup_storage_candidates=$(echo "$storage_json" | grep -o '{[^}]*"content":[^}]*backup[^}]*}' | grep -o '"storage":"[^"]*"' | cut -d':' -f2 | tr -d '"' | tr -d ' ')
+        
+        if [[ -n "$backup_storage_candidates" ]]; then
+          # Take the first backup-capable storage
+          backup_storage=$(echo "$backup_storage_candidates" | head -1)
+          log_info "Auto-detected backup-capable storage: $backup_storage"
+        else
+          # If no dedicated backup storage found, check if PROXMOX_STORAGE supports backups
+          if [[ -n "$PROXMOX_STORAGE" ]]; then
+            local proxmox_storage_content=$(echo "$storage_json" | grep -o "{[^}]*\"storage\":\"$PROXMOX_STORAGE\"[^}]*}" | grep -o '"content":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+            
+            if [[ "$proxmox_storage_content" == *"backup"* ]]; then
+              backup_storage="$PROXMOX_STORAGE"
+              log_info "Verified PROXMOX_STORAGE '$PROXMOX_STORAGE' supports backups"
+            else
+              log_warn "PROXMOX_STORAGE '$PROXMOX_STORAGE' does not support backups"
+              
+              # Look for any storage with backup capability
+              local any_backup_storage=$(echo "$storage_json" | grep -o '{[^}]*"content":[^}]*backup[^}]*}' | head -1 | grep -o '"storage":"[^"]*"' | cut -d':' -f2 | tr -d '"' | tr -d ' ')
+              
+              if [[ -n "$any_backup_storage" ]]; then
+                backup_storage="$any_backup_storage"
+                log_info "Found alternative backup-capable storage: $backup_storage"
+              fi
+            fi
+          fi
+        fi
+      else
+        # Fallback to simple pvesm command if pvesh fails
+        local storage_output=$(ssh_cmd_quiet "$host" "pvesm status" "$PROXMOX_USER")
+        if [[ -n "$storage_output" ]]; then
+          # Look for backup in name or type
+          local backup_candidate=$(echo "$storage_output" | grep -i "backup" | awk '{print $1}' | head -1)
+          
+          if [[ -n "$backup_candidate" ]]; then
+            backup_storage="$backup_candidate"
+            log_info "Found storage with backup in name: $backup_storage"
+          fi
+        fi
+      fi
+    fi
+  fi
+  
+  # If still no storage found and we're in interactive mode, ask user
+  if [[ -z "$backup_storage" && "$INTERACTIVE" == "true" ]]; then
+    # Show available storages to the user
+    if [[ ${#PROXMOX_HOSTS[@]} -gt 0 ]]; then
+      local host="${PROXMOX_HOSTS[0]}"
+      local storage_list=$(ssh_cmd_quiet "$host" "pvesm status" "$PROXMOX_USER")
+      
+      echo "Available storage:"
+      echo "$storage_list"
+      echo ""
+    fi
+    
+    read -p "Please select a storage for backups: " user_storage
+    if [[ -n "$user_storage" ]]; then
+      backup_storage="$user_storage"
+    else
+      log_error "No storage specified for backups"
+      return 1
+    fi
+  fi
+  
+  # Final fallback if still not found
+  if [[ -z "$backup_storage" ]]; then
+    log_error "Could not determine a suitable backup storage"
+    return 1
+  fi
+    
+  # Only return the storage name, nothing else
+  printf "%s" "$backup_storage"
+  return 0
+}
+
+# Helper function to create VM snapshot or backup
+function create_vm_point_in_time() {
+  local node="$1"
+  local operation_label="$2"
+  local etcd_snapshot_name="$3"
+  local custom_description="$4"
+  local operation_type="$5"  # 'snapshot' or 'backup'
+  
+  # Get node details from config
+  local vm_id=$(yq -r ".node_details.$node.proxmox_vmid // \"\"" "$CONFIG_FILE")
+  local proxmox_host=$(yq -r ".node_details.$node.proxmox_host // \"\"" "$CONFIG_FILE")
+  
+  if [[ -z "$vm_id" || -z "$proxmox_host" ]]; then
+    log_error "Could not find VM ID or Proxmox host for node $node in config"
+    return 1
+  fi
+  
+  log_info "Creating $operation_type for VM $vm_id on $proxmox_host..."
+  
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[DRY RUN] Would create $operation_type for VM $vm_id"
+    return 0
+  fi
+  
+  # Create description
+  local desc=""
+  
+  if [[ "$operation_type" == "snapshot" ]]; then
+    # For snapshots, keep the etcd reference and more detailed format
+    desc="K3s cluster $operation_type - Node: $node - Etcd: $etcd_snapshot_name"
+    
+    # Add custom description if provided
+    if [[ -n "$custom_description" ]]; then
+      desc="${desc} - ${custom_description}"
+    fi
+  else
+    # For backups, use Proxmox-style format
+    desc="{{node}} - {{vmid}} ({{guestname}})"
+    
+    # Add custom description if provided
+    if [[ -n "$custom_description" ]]; then
+      desc="${desc} - ${custom_description}"
+    fi
+  fi
+  
+  # Execute the appropriate command based on operation type
+  if [[ "$operation_type" == "snapshot" ]]; then
+    # Create VM snapshot
+    local cmd="qm snapshot $vm_id \"$operation_label\" --description \"$desc\""
+    
+    log_info "Running snapshot command: $cmd"
+    local result=$(ssh_cmd_capture "$proxmox_host" "$cmd" "$PROXMOX_USER")
+    local exit_code=$?
+    
+    if [[ $exit_code -ne 0 ]]; then
+      log_error "Failed to create snapshot for VM $vm_id: $result"
+      return 1
+    fi
+
+    # Verify snapshot was created
+    local check=$(ssh_cmd_capture "$proxmox_host" "qm listsnapshot $vm_id | grep -w \"$operation_label\"" "$PROXMOX_USER")
+    if [[ -z "$check" ]]; then
+      log_error "Snapshot command appeared to succeed but snapshot '$operation_label' not found"
+      return 1
+    fi
+  else
+    # Create VM backup (vzdump)
+    # Get backup storage
+    log_info "Getting backup storage for $node..."
+    local backup_storage=$(get_backup_storage)
+    if [[ -z "$backup_storage" ]]; then
+      log_error "No valid backup storage found or specified"
+      return 1
+    fi
+    
+    log_info "Using backup storage: '${backup_storage}'"
+    
+    # Build the vzdump command according to man page 
+    # --mode stop: automatically stop/start the VM
+    local backup_cmd="vzdump ${vm_id} --compress zstd --mode stop --storage ${backup_storage}"
+    backup_cmd="${backup_cmd} --notes-template \"${desc}\""
+    
+    log_info "Running backup command: $backup_cmd"
+    log_info "This operation may take several minutes..."
+    
+    # Use ssh_cmd function to execute command - this handles host keys properly
+    local result=$(ssh_cmd "$proxmox_host" "$backup_cmd" "root" "capture")
+    local exit_code=$?
+    
+    if [[ $exit_code -ne 0 ]]; then
+      log_error "Failed to backup VM $vm_id: $result"
+      return 1
+    fi
+    
+    # Check for success indicators in the output
+    if echo "$result" | grep -q "Backup job finished successfully"; then
+      log_success "Backup completed successfully according to vzdump output"
+      
+      # Extract backup filename if present in output
+      local backup_file=$(echo "$result" | grep -o "creating vzdump archive '[^']*'" | cut -d "'" -f 2)
+      if [[ -n "$backup_file" ]]; then
+        log_info "Backup file created: $backup_file"
+      fi
+    # Also check for partial success indicators
+    elif echo "$result" | grep -q "creating vzdump archive"; then
+      log_success "Backup appears to have started successfully"
+      log_info "Check Proxmox storage for the backup file"
+    else
+      log_warn "Could not confirm successful backup completion from vzdump output"
+      log_warn "Check Proxmox logs or storage for verification"
+    fi
+  fi
+  
+  log_success "$operation_type for VM $vm_id created successfully"
+  return 0
+}
+
+# Create snapshots or backups of all VMs in the cluster
+function create_cluster_point_in_time() {
+  local operation_type="${1:-snapshot}"  # Default to snapshot if not specified
+  
+  # Validate operation type
+  if [[ "$operation_type" != "snapshot" && "$operation_type" != "backup" ]]; then
+    log_error "Invalid operation type: $operation_type (must be 'snapshot' or 'backup')"
+    return 1
+  fi
+  
+  local operation_name
+  local operation_verb
+  
+  if [[ "$operation_type" == "snapshot" ]]; then
+    operation_name="Snapshots"
+    operation_verb="Snapshotting"
+  else
+    operation_name="Backups"
+    operation_verb="Backing up"
+  fi
+  
+  log_section "Creating Cluster $operation_name"
+  
+  # Asking about the operation for the entire cluster is handled in run_interactive_mode
+  local process_all_nodes=true
   
   # In non-interactive mode, or if called from run_interactive_mode after node selection
   # we should just proceed with whatever NODES contains
-  if [[ "$INTERACTIVE" == "true" && -z "$1" ]]; then
-    # Only if directly called in interactive mode and no argument provided
-    # (we'll use $1 as a flag to indicate we've been called from run_interactive_mode)
+  if [[ "$INTERACTIVE" == "true" && -z "$2" ]]; then
+    # Only if directly called in interactive mode and no second argument provided
+    # (we'll use $2 as a flag to indicate we've been called from run_interactive_mode)
     original_nodes=("${NODES[@]}")
   fi
   
-  # Validate cluster before snapshot (only once at the beginning)
-  log_subsection "Pre-Snapshot Validation"
+  # Validate cluster before operation (only once at the beginning)
+  log_subsection "Pre-Operation Validation"
   validate_cluster || {
     if [[ "$FORCE" != "true" ]]; then
-      log_error "Cluster validation failed. Use --force to snapshot anyway."
+      log_error "Cluster validation failed. Use --force to $operation_type anyway."
       return 1
     fi
-    log_warn "Continuing snapshot creation despite validation failure due to --force flag"
+    log_warn "Continuing $operation_type creation despite validation failure due to --force flag"
   }
   
-  # Ask for snapshot name or use default
-  log_subsection "Snapshot Configuration"
-  local snapshot_specific_name="auto"
+  # Ask for operation name or use default
+  log_subsection "$operation_name Configuration"
+  local specific_name="auto"
   local custom_description=""
-  local snapshot_name="untitled"
+  local operation_label="untitled"
   if [[ "$INTERACTIVE" == "true" ]]; then
     local name_accepted=false
     
     while [[ "$name_accepted" != "true" ]]; do
-      read -p "Enter a specific name for this snapshot (leave empty for 'auto'): " snapshot_input_name
-      if [[ -z "$snapshot_input_name" ]]; then
-        snapshot_specific_name="auto"
+      read -p "Enter a specific name for this $operation_type (leave empty for 'auto'): " input_name
+      if [[ -z "$input_name" ]]; then
+        specific_name="auto"
         name_accepted=true
       else
-        snapshot_specific_name="$snapshot_input_name"
+        specific_name="$input_name"
         
-        # Format and validate the snapshot name
+        # Format and validate the name
         local raw_timestamp=$(date +"%Y%m%d-%H%M%S")
-        local expected_name="${snapshot_specific_name}-${CLUSTER_NAME}-${raw_timestamp}"
-        local formatted_name=$(format_snapshot_name "$snapshot_specific_name" "$CLUSTER_NAME" "$raw_timestamp")
+        local expected_name="${specific_name}-${CLUSTER_NAME}-${raw_timestamp}"
+        local formatted_name=$(format_snapshot_name "$specific_name" "$CLUSTER_NAME" "$raw_timestamp")
         
         if [[ "$formatted_name" != "$expected_name" ]]; then
-          log_info "Snapshot name adjusted for compatibility: '$formatted_name'"
+          log_info "$operation_name name adjusted for compatibility: '$formatted_name'"
           # Ask user to confirm the adjusted name
-          read -p "Use this snapshot name? (y/n): " confirm_name
+          read -p "Use this name? (y/n): " confirm_name
           if [[ "$confirm_name" == "y" ]]; then
-            snapshot_name="$formatted_name"
+            operation_label="$formatted_name"
             name_accepted=true
           fi
           # If user says no, the loop will continue and ask for a new name
         else
-          snapshot_name="$formatted_name"
+          operation_label="$formatted_name"
           name_accepted=true
         fi
       fi
     done
     
     # Ask for custom description
-    read -p "Enter a custom description for this snapshot (optional): " custom_description_input
+    read -p "Enter a custom description for this $operation_type (optional): " custom_description_input
     if [[ -n "$custom_description_input" ]]; then
       custom_description="$custom_description_input"
     fi
+  else
+    # In non-interactive mode, use BACKUP_NAME as the operation label
+    operation_label="${BACKUP_PREFIX}-${TIMESTAMP}"
   fi
   
-  # Create etcd snapshot name from validated snapshot name
-  local etcd_snapshot_name="etcd-${snapshot_name}"
+  # Create etcd snapshot name from validated operation name
+  local etcd_snapshot_name="etcd-${operation_label}"
   
-  log_info "Creating snapshot with name: $snapshot_name"
+  log_info "Creating $operation_type with name: $operation_label"
   
   # Create etcd snapshot first
   log_subsection "Creating etcd Snapshot"
@@ -287,7 +477,7 @@ function snapshot_cluster() {
       log_error "Failed to create etcd snapshot. Use --force to continue anyway."
       return 1
     fi
-    log_warn "Continuing snapshot creation despite etcd snapshot failure due to --force flag"
+    log_warn "Continuing $operation_type creation despite etcd snapshot failure due to --force flag"
   }
   
   # Sort nodes by role - workers first, then masters
@@ -308,7 +498,7 @@ function snapshot_cluster() {
   log_info "Then processing master nodes: ${master_nodes[*]}"
   
   # Save original nodes array
-  if [[ "$snapshot_all_nodes" == "true" ]]; then
+  if [[ "$process_all_nodes" == "true" ]]; then
     original_nodes=("${NODES[@]}")
   fi
   
@@ -317,44 +507,116 @@ function snapshot_cluster() {
     log_subsection "Processing Worker Nodes"
     NODES=("${worker_nodes[@]}")
     
-    # Shutdown worker nodes
-    log_info "Shutting down worker nodes..."
-    shutdown_node "true" || {
-      if [[ "$FORCE" != "true" ]]; then
-        log_error "Failed to shutdown worker nodes. Aborting."
-        NODES=("${original_nodes[@]}")
-        return 1
-      fi
-      log_warn "Continuing despite worker node shutdown failure due to --force flag"
-    }
-    
-    # Create snapshots for worker nodes
-    log_operation_step "Creating Snapshots" "worker nodes"
-    for node in "${worker_nodes[@]}"; do
-      log_info "Creating snapshot for worker node $node..."
-      create_vm_snapshot "$node" "$snapshot_name" "$etcd_snapshot_name" "$custom_description" || {
+    if [[ "$operation_type" == "snapshot" ]]; then
+      # For snapshots, we need to handle shutdown/start manually
+      # Shutdown worker nodes
+      log_info "Shutting down worker nodes..."
+      shutdown_node "true" || {
         if [[ "$FORCE" != "true" ]]; then
-          log_error "Failed to create snapshot for worker node $node. Aborting."
+          log_error "Failed to shutdown worker nodes. Aborting."
           NODES=("${original_nodes[@]}")
           return 1
         fi
-        log_warn "Continuing despite snapshot failure for worker node $node due to --force flag"
+        log_warn "Continuing despite worker node shutdown failure due to --force flag"
       }
-    done
-    
-    # Start worker nodes
-    log_operation_step "Starting" "worker nodes"
-    for node in "${worker_nodes[@]}"; do
-      log_info "Starting worker node $node..."
-      start_node "$node" || {
-        if [[ "$FORCE" != "true" ]]; then
-          log_error "Failed to start worker node $node. Aborting."
+      
+      # Create snapshots for worker nodes
+      log_operation_step "$operation_verb" "worker nodes"
+      for node in "${worker_nodes[@]}"; do
+        log_info "Creating $operation_type for worker node $node..."
+        create_vm_point_in_time "$node" "$operation_label" "$etcd_snapshot_name" "$custom_description" "$operation_type" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to create $operation_type for worker node $node. Aborting."
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite $operation_type failure for worker node $node due to --force flag"
+        }
+      done
+      
+      # Start worker nodes
+      log_operation_step "Starting" "worker nodes"
+      for node in "${worker_nodes[@]}"; do
+        log_info "Starting worker node $node..."
+        start_node "$node" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to start worker node $node. Aborting."
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite start failure for worker node $node due to --force flag"
+        }
+      done
+    else
+      # For backups, vzdump handles VM shutdown/start
+      # Just need to cordon and drain nodes, then stop k3s
+      log_info "Preparing worker nodes for backup..."
+      
+      for node in "${worker_nodes[@]}"; do
+        log_info "Cordoning worker node $node..."
+        cordon_node "$node" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to cordon worker node $node. Aborting."
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite cordon failure for worker node $node due to --force flag"
+        }
+        
+        log_info "Draining worker node $node..."
+        drain_node "$node" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to drain worker node $node. Aborting."
+            # Uncordon the node since we're not continuing
+            uncordon_node "$node"
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite drain failure for worker node $node due to --force flag"
+        }
+        
+        # Stop k3s service on the node
+        log_info "Stopping k3s service on $node..."
+        if ! stop_k3s_service "$node" "$FORCE"; then
+          log_error "Failed to stop k3s service on $node. Aborting."
+          # Uncordon the node since we're not continuing
+          uncordon_node "$node"
           NODES=("${original_nodes[@]}")
           return 1
         fi
-        log_warn "Continuing despite start failure for worker node $node due to --force flag"
-      }
-    done
+      done
+      
+      # Create backups for worker nodes - vzdump will handle VM shutdown/start
+      log_operation_step "$operation_verb" "worker nodes"
+      for node in "${worker_nodes[@]}"; do
+        log_info "Creating $operation_type for worker node $node..."
+        create_vm_point_in_time "$node" "$operation_label" "$etcd_snapshot_name" "$custom_description" "$operation_type" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to create $operation_type for worker node $node. Aborting."
+            # Try to uncordon node 
+            uncordon_node "$node"
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite $operation_type failure for worker node $node due to --force flag"
+        }
+        
+        # After backup is complete, vzdump has restarted the VM, wait for k3s to be ready
+        log_info "Waiting for k3s service to be ready on $node..."
+        wait_for_k3s_ready "$node" 180
+        
+        # Uncordon node
+        log_info "Uncordoning worker node $node..."
+        uncordon_node "$node" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to uncordon worker node $node. Aborting."
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite uncordon failure for worker node $node due to --force flag"
+        }
+      done
+    fi
   else
     log_info "No worker nodes to process"
   fi
@@ -368,39 +630,94 @@ function snapshot_cluster() {
       # Set NODES to just this master node for processing
       NODES=("$node")
       
-      # Shutdown this master node
-      log_operation_step "Shutting Down" "master node $node"
-      shutdown_node "true" || {
-        if [[ "$FORCE" != "true" ]]; then
-          log_error "Failed to shutdown master node $node. Performing cleanup..."
-          cleanup_node "$node" "snapshot" "$etcd_snapshot_name"
+      if [[ "$operation_type" == "snapshot" ]]; then
+        # For snapshots, handle shutdown/start manually
+        
+        # Shutdown this master node
+        log_operation_step "Shutting Down" "master node $node"
+        shutdown_node "true" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to shutdown master node $node. Performing cleanup..."
+            cleanup_node "$node" "$operation_type" "$etcd_snapshot_name"
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite master node shutdown failure due to --force flag"
+        }
+        
+        # Create snapshot for this master node
+        log_operation_step "Creating $operation_name" "master node $node"
+        create_vm_point_in_time "$node" "$operation_label" "$etcd_snapshot_name" "$custom_description" "$operation_type" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to create $operation_type for master node $node. Aborting."
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite $operation_type failure for master node $node due to --force flag"
+        }
+        
+        # Start this master node
+        log_operation_step "Starting" "master node $node"
+        start_node "$node" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to start master node $node. Aborting."
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite start failure for master node $node due to --force flag"
+        }
+      else
+        # For backups, vzdump handles VM shutdown/start
+        # Prepare node (cordon, drain, stop k3s)
+        log_operation_step "Preparing" "master node $node for backup"
+        
+        # Cordon the node
+        log_info "Cordoning master node $node..."
+        cordon_node "$node" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to cordon master node $node. Aborting."
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite cordon failure for master node $node due to --force flag"
+        }
+        
+        # Drain the node
+        log_info "Draining master node $node..."
+        drain_node "$node" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to drain master node $node. Aborting."
+            # Uncordon the node since we're not continuing
+            uncordon_node "$node"
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite drain failure for master node $node due to --force flag"
+        }
+        
+        # Stop k3s service on the node
+        log_info "Stopping k3s service on $node..."
+        if ! stop_k3s_service "$node" "$FORCE"; then
+          log_error "Failed to stop k3s service on $node. Aborting."
+          # Uncordon the node since we're not continuing
+          uncordon_node "$node"
           NODES=("${original_nodes[@]}")
           return 1
         fi
-        log_warn "Continuing despite master node shutdown failure due to --force flag"
-      }
-      
-      # Create snapshot for this master node
-      log_operation_step "Creating Snapshot" "master node $node"
-      create_vm_snapshot "$node" "$snapshot_name" "$etcd_snapshot_name" "$custom_description" || {
-        if [[ "$FORCE" != "true" ]]; then
-          log_error "Failed to create snapshot for master node $node. Aborting."
-          NODES=("${original_nodes[@]}")
-          return 1
-        fi
-        log_warn "Continuing despite snapshot failure for master node $node due to --force flag"
-      }
-      
-      # Start this master node
-      log_operation_step "Starting" "master node $node"
-      start_node "$node" || {
-        if [[ "$FORCE" != "true" ]]; then
-          log_error "Failed to start master node $node. Aborting."
-          NODES=("${original_nodes[@]}")
-          return 1
-        fi
-        log_warn "Continuing despite start failure for master node $node due to --force flag"
-      }
+        
+        # Create backup for this master node - vzdump will handle VM shutdown/start
+        log_operation_step "Creating $operation_name" "master node $node"
+        create_vm_point_in_time "$node" "$operation_label" "$etcd_snapshot_name" "$custom_description" "$operation_type" || {
+          if [[ "$FORCE" != "true" ]]; then
+            log_error "Failed to create $operation_type for master node $node. Aborting."
+            # Try to uncordon node
+            uncordon_node "$node"
+            NODES=("${original_nodes[@]}")
+            return 1
+          fi
+          log_warn "Continuing despite $operation_type failure for master node $node due to --force flag"
+        }
+      fi
       
       # Wait for node initialization
       log_operation_step "Initializing" "master node $node"
@@ -440,20 +757,20 @@ function snapshot_cluster() {
   NODES=("${original_nodes[@]}")
   
   # Final verification and cleanup
-  log_subsection "Post-Snapshot Verification and Cleanup"
+  log_subsection "Post-Operation Verification and Cleanup"
   
   # Only run final validation if we processed more than one node
   # (to avoid redundant validation with the per-node validation above)
   if [[ ${#original_nodes[@]} -gt 1 ]]; then
-    # Verify cluster health after all snapshots
-    log_operation_step "Final Cluster Validation" "after all snapshots"
+    # Verify cluster health after all operations
+    log_operation_step "Final Cluster Validation" "after all $operation_name"
     validate_cluster || {
-      log_warn "Cluster validation after snapshots showed issues. Check cluster state."
+      log_warn "Cluster validation after $operation_name showed issues. Check cluster state."
     }
   fi
 
   # Ensure all nodes are uncordoned
-  log_operation_step "Ensuring Uncordoned Nodes" "after snapshot operations"
+  log_operation_step "Ensuring Uncordoned Nodes" "after $operation_type operations"
   local uncordon_failures=0
 
   for node in "${original_nodes[@]}"; do
@@ -512,69 +829,34 @@ function snapshot_cluster() {
     fi
   done
 
-  # Clean up old snapshots based on retention policy
-  log_operation_step "Cleaning Up Old Snapshots" "based on retention policy"
-  clean_old_snapshots
+  # Clean up old items based on retention policy
+  log_operation_step "Cleaning Up Old $operation_name" "based on retention policy"
+  if [[ "$operation_type" == "snapshot" ]]; then
+    clean_old_snapshots
+  else
+    clean_old_backups
+  fi
   
   if [[ $uncordon_failures -gt 0 ]]; then
     log_warn "$uncordon_failures nodes may still be cordoned. Manual verification recommended."
   fi
   
-  log_success "Cluster snapshots created successfully with name: $snapshot_name"
+  log_success "Cluster $operation_name created successfully with name: $operation_label"
   return 0
 }
 
-# Helper function to create VM snapshot
-function create_vm_snapshot() {
-  local node="$1"
-  local snapshot_name="$2"
-  local etcd_snapshot_name="$3"
-  local custom_description="$4"
-  
-  # Get node details from config
-  local vm_id=$(yq -r ".node_details.$node.proxmox_vmid // \"\"" "$CONFIG_FILE")
-  local proxmox_host=$(yq -r ".node_details.$node.proxmox_host // \"\"" "$CONFIG_FILE")
-  
-  if [[ -z "$vm_id" || -z "$proxmox_host" ]]; then
-    log_error "Could not find VM ID or Proxmox host for node $node in config"
-    return 1
-  fi
-  
-  log_info "Creating snapshot for VM $vm_id on $proxmox_host..."
-  
-  if [[ "$DRY_RUN" == "true" ]]; then
-    log_info "[DRY RUN] Would create snapshot for VM $vm_id"
-    return 0
-  fi
-  
-  # Create VM snapshot
-  local snapshot_desc="K3s cluster snapshot - Node: $node - Etcd: $etcd_snapshot_name"
-  
-  # Add custom description if provided
-  if [[ -n "$custom_description" ]]; then
-    snapshot_desc="${snapshot_desc} - ${custom_description}"
-  fi
-  
-  local snapshot_cmd="qm snapshot $vm_id \"$snapshot_name\" --description \"$snapshot_desc\""
-  
-  log_info "Running snapshot command: $snapshot_cmd"
-  local snapshot_result=$(ssh_cmd_capture "$proxmox_host" "$snapshot_cmd" "$PROXMOX_USER")
-  local exit_code=$?
-  
-  if [[ $exit_code -ne 0 ]]; then
-    log_error "Failed to create snapshot for VM $vm_id: $snapshot_result"
-    return 1
-  fi
+# Wrapper function for backward compatibility - snapshots
+function snapshot_cluster() {
+  local from_interactive="$1"  # Pass this flag to the unified function
+  create_cluster_point_in_time "snapshot" "$from_interactive"
+  return $?
+}
 
-  # Verify snapshot was created
-  local snapshot_check=$(ssh_cmd_capture "$proxmox_host" "qm listsnapshot $vm_id | grep -w \"$snapshot_name\"" "$PROXMOX_USER")
-  if [[ -z "$snapshot_check" ]]; then
-    log_error "Snapshot command appeared to succeed but snapshot '$snapshot_name' not found"
-    return 1
-  fi
-  
-  log_success "Snapshot for VM $vm_id created successfully"
-  return 0
+# Wrapper function for backward compatibility - backups
+function backup_cluster() {
+  local from_interactive="$1"  # Pass this flag to the unified function
+  create_cluster_point_in_time "backup" "$from_interactive"
+  return $?
 }
 
 # Clean up old backups based on retention policy

@@ -510,12 +510,7 @@ function ssh_cmd() {
       ssh_debug_log "Connection test FAILED"
     fi
     
-    # For special commands involving qm, add extra debugging
-    if [[ "$cmd" == "qm "* || "$cmd" == *"qm "* ]]; then
-      ssh_debug_log "IMPORTANT: Detected qm command: $cmd"
-    fi
-    
-    # Construct the SSH command - this is where issues might occur
+    # Construct the SSH command
     local ssh_full_cmd="ssh -o BatchMode=yes -o ConnectTimeout=10 -p $port $user@$target \"$cmd\""
     ssh_debug_log "Full SSH command being executed: $ssh_full_cmd"
     
@@ -634,20 +629,20 @@ function run_interactive_mode() {
   echo "1. Validate cluster health"
   echo "2. Shutdown node"
   echo "3. Start node"
-  echo "4. Create backup"
-  echo "5. Create snapshot"
-  echo "6. Replace node"
-  echo "7. Restore cluster"
-  echo "8. Generate sample config"
-  echo "9. Display version info"
+  echo "4. Create snapshot or backup"
+  echo "5. Replace node"
+  echo "6. Restore cluster"
+  echo "7. Generate sample config"
+  echo "8. Display version info"
+  echo "9. Debug run"
   echo "0. Exit"
   
-  read -p "Select an option (0-9): " option
+  read -p "Select an option (0-8): " option
   
-  # Add this block RIGHT HERE to verify SSH hosts immediately after option selection
+  # Add this block to verify SSH hosts immediately after option selection
   # but before any option-specific operations
   case "$option" in
-    1|2|3|4|5|6|7)
+    1|2|3|4|5|6)
       # For options that require SSH, verify connectivity first
       verify_ssh_hosts || return 1
       ;;
@@ -748,36 +743,41 @@ function run_interactive_mode() {
       ;;
     
     4)
-      # Interactive backup
-      if confirm "Create backup of the entire cluster?"; then
-        read -p "Enter retention count (leave empty for default: $DEFAULT_RETENTION_COUNT): " retention
-        
-        if [[ -n "$retention" ]]; then
-          RETENTION_COUNT="$retention"
-        fi
-        
-        backup_cluster
-      else
-        log_info "Backup cancelled"
-        return 0
-      fi
-      ;;
-    
-    5)
-      # Interactive snapshot
-      log_section "Snapshot Configuration"
+      # Unified snapshot/backup option
+      echo "Point-in-time backup options:"
+      echo "1. Create snapshot (VM internal)"
+      echo "2. Create backup (separate backup file)"
+      read -p "Select operation type (1-2): " operation_type
       
-      if confirm "Create snapshot of the entire cluster?" "y"; then
-        # All nodes will be snapshotted
-        read -p "Enter retention count (leave empty for default: $DEFAULT_RETENTION_COUNT): " retention
-        
-        if [[ -n "$retention" ]]; then
-          RETENTION_COUNT="$retention"
+      local op_type=""
+      case "$operation_type" in
+        1) op_type="snapshot" ;;
+        2) op_type="backup" ;;
+        *) log_error "Invalid option" && return 1 ;;
+      esac
+      
+      # Node selection
+      echo "Select nodes to process:"
+      echo "1. All cluster nodes"
+      echo "2. Specific nodes"
+      read -p "Select option (1-2): " node_selection
+      
+      if [[ "$node_selection" == "1" ]]; then
+        # Process all nodes
+        if confirm "Create $op_type of the entire cluster?"; then
+          read -p "Enter retention count (leave empty for default: $DEFAULT_RETENTION_COUNT): " retention
+          
+          if [[ -n "$retention" ]]; then
+            RETENTION_COUNT="$retention"
+          fi
+          
+          create_cluster_point_in_time "$op_type" "from_interactive"
+        else
+          log_info "Operation cancelled"
+          return 0
         fi
-        
-        snapshot_cluster
-      else
-        # Select specific nodes to snapshot
+      elif [[ "$node_selection" == "2" ]]; then
+        # Select specific nodes
         log_subsection "Node Selection"
         echo "Available nodes:"
         for i in "${!NODES[@]}"; do
@@ -787,10 +787,10 @@ function run_interactive_mode() {
         # Get node selection
         local original_nodes=("${NODES[@]}")
         local selected_indices=()
-        read -p "Enter node numbers to snapshot (comma-separated, e.g., 1,3,4): " node_selection
+        read -p "Enter node numbers to process (comma-separated, e.g., 1,3,4): " nodes_input
         
         # Parse selection
-        IFS=',' read -ra selected_items <<< "$node_selection"
+        IFS=',' read -ra selected_items <<< "$nodes_input"
         for item in "${selected_items[@]}"; do
           # Trim any whitespace
           item=$(echo "$item" | tr -d '[:space:]')
@@ -814,7 +814,7 @@ function run_interactive_mode() {
         
         # Replace NODES array with selected nodes
         NODES=("${selected_nodes[@]}")
-        log_info "Selected nodes for snapshot: ${NODES[*]}"
+        log_info "Selected nodes for $op_type: ${NODES[*]}"
         
         read -p "Enter retention count (leave empty for default: $DEFAULT_RETENTION_COUNT): " retention
         
@@ -822,19 +822,22 @@ function run_interactive_mode() {
           RETENTION_COUNT="$retention"
         fi
         
-        # Capture the return value of snapshot_cluster
-        snapshot_cluster "from_interactive"
-        local snapshot_result=$?
+        # Execute the operation
+        create_cluster_point_in_time "$op_type" "from_interactive"
+        local result=$?
         
         # Restore original nodes array
         NODES=("${original_nodes[@]}")
         
-        # Return the result of snapshot_cluster
-        return $snapshot_result
+        # Return the operation result
+        return $result
+      else
+        log_error "Invalid option: $node_selection"
+        return 1
       fi
       ;;
     
-    6)
+    5)
       # Interactive replace
       if [[ ${#NODES[@]} -eq 0 ]]; then
         log_error "No nodes configured"
@@ -867,12 +870,12 @@ function run_interactive_mode() {
       fi
       ;;
     
-    7)
+    6)
       # Interactive restore
       run_restore_wizard
       ;;
       
-    8)
+    7)
       # Generate sample config
       read -p "Enter config file name or path: " config_path
       
@@ -892,9 +895,24 @@ function run_interactive_mode() {
       FORCE="false"
       ;;
 
-    9)
+    8)
       # Display version information
       cmd_version
+      ;;
+
+    9)
+      # Debug run
+      local vm_id=102
+      local desc="A debug description"
+
+      local backup_storage=$(get_backup_storage)
+      echo "Found backup storage: $backup_storage"
+      
+      local backup_cmd="vzdump $vm_id --compress --mode snapshot --storage $backup_storage"
+      backup_cmd="$backup_cmd --description \"$desc\""
+
+      echo "Would execute the following command:"
+      echo "$backup_cmd"
       ;;
 
     0)

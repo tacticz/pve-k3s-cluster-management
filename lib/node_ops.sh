@@ -109,7 +109,7 @@ function cordon_node() {
 # Function to wait for k3s service to be ready on a node
 function wait_for_k3s_ready() {
   local node="$1"
-  local timeout="${2:-120}"  # 2 minute timeout
+  local timeout="${2:-180}"  # 2 minute timeout
   
   log_info "Waiting for k3s service to be active on $node..."
   local count=0
@@ -443,6 +443,52 @@ function drain_node() {
   return 0
 }
 
+# Stop k3s service on a node
+function stop_k3s_service() {
+  local node="$1"
+  local force="${2:-false}"
+  
+  log_info "Stopping k3s service on $node..."
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[DRY RUN] Would stop k3s service on $node"
+    return 0
+  fi
+  
+  local k3s_stop_result=$(ssh_cmd_capture "$node" "systemctl stop k3s.service k3s-agent.service 2>/dev/null" "root")
+  local exit_code=$?
+  
+  if [[ $exit_code -ne 0 ]]; then
+    log_warn "Failed to gracefully stop k3s on $node: $k3s_stop_result"
+    
+    if [[ "$force" == "true" || "$FORCE" == "true" ]]; then
+      log_warn "Attempting to force stop k3s processes on $node..."
+      ssh_cmd_quiet "$node" "pkill -9 k3s 2>/dev/null" "root"
+      sleep 5
+    fi
+  fi
+  
+  # Verify k3s is stopped
+  local k3s_status=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service k3s-agent.service 2>/dev/null || echo 'inactive'" "root")
+  
+  if [[ "$k3s_status" == "active" ]]; then
+    log_warn "k3s service is still running on $node despite stop attempt"
+    
+    if [[ "$force" != "true" && "$FORCE" != "true" && "$INTERACTIVE" != "true" ]]; then
+      log_error "Failed to stop k3s service on $node. Use --force to continue anyway."
+      return 1
+    elif [[ "$INTERACTIVE" == "true" ]]; then
+      if ! confirm "Continue despite k3s service stop failure on $node?"; then
+        log_error "Operation cancelled by user."
+        return 1
+      fi
+    fi
+    return 0  # If force or user confirmed, return success anyway
+  else
+    log_success "k3s service stopped on $node"
+    return 0
+  fi
+}
+
 # Shutdown a node
 function shutdown_node() {
   if [[ ${#NODES[@]} -eq 0 ]]; then
@@ -533,47 +579,15 @@ function shutdown_node() {
     }
     
     # 3. Stop k3s service on the node
-    log_info "Stopping k3s service on $node..."
-    if [[ "$DRY_RUN" != "true" ]]; then
-      local k3s_stop_result=$(ssh_cmd_capture "$node" "systemctl stop k3s.service k3s-agent.service 2>/dev/null" "$PROXMOX_USER")
-      local exit_code=$?
-      
-      if [[ $exit_code -ne 0 ]]; then
-        log_warn "Failed to gracefully stop k3s on $node: $k3s_stop_result"
-        
-        if [[ "$FORCE" == "true" ]]; then
-          log_warn "Attempting to force stop k3s processes on $node..."
-          ssh_cmd_quiet "$node" "pkill -9 k3s 2>/dev/null" "$PROXMOX_USER"
-          sleep 5
-        fi
+    if ! stop_k3s_service "$node" "$FORCE"; then
+      if [[ "$FORCE" != "true" ]]; then
+        log_error "Failed to stop k3s service on $node. Aborting shutdown."
+        # Uncordon the node since we're not continuing
+        uncordon_node "$node"
+        shutdown_success=false
+        continue
       fi
-      
-      # Verify k3s is stopped
-      local k3s_status=$(ssh_cmd_quiet "$node" "systemctl is-active k3s.service k3s-agent.service 2>/dev/null || echo 'inactive'" "$PROXMOX_USER")
-      
-      if [[ "$k3s_status" == "active" ]]; then
-        log_warn "k3s service is still running on $node despite stop attempt. VM shutdown might fail."
-        
-        if [[ "$FORCE" != "true" && "$INTERACTIVE" != "true" ]]; then
-          log_error "Aborting. Use --force to continue anyway."
-          # Uncordon the node since we're not continuing
-          uncordon_node "$node"
-          shutdown_success=false
-          continue
-        elif [[ "$INTERACTIVE" == "true" ]]; then
-          if ! confirm "Continue with VM shutdown despite k3s service stop failure?"; then
-            log_error "Shutdown operation cancelled by user."
-            # Uncordon the node since we're not continuing
-            uncordon_node "$node" 
-            shutdown_success=false
-            continue
-          fi
-        fi
-      else
-        log_success "k3s service stopped on $node"
-      fi
-    else
-      log_info "[DRY RUN] Would stop k3s service on $node"
+      log_warn "Continuing despite k3s service stop failure due to --force flag"
     fi
     
     # 4. Shutdown the VM via Proxmox
@@ -735,7 +749,7 @@ function start_node() {
     log_success "VM $vm_id started successfully"
     
     # Wait for the node to be reachable
-    local timeout=120
+    local timeout=180
     log_wait_sequence "$node to be reachable" "$timeout"
     
     local count=0
@@ -853,7 +867,7 @@ function cleanup_node() {
   # Additional verification - check if node shows as Ready
   if [[ -n "$kubectl_node" ]]; then
     log_info "Waiting for node $node to be Ready..."
-    local timeout=120
+    local timeout=180
     local count=0
     
     while [[ $count -lt $timeout ]]; do
@@ -1093,7 +1107,7 @@ function replace_node() {
     
     # Wait for the node to be reachable
     log_info "Waiting for $node to be reachable..."
-    local timeout=120
+    local timeout=180
     local count=0
     while [[ $count -lt $timeout ]]; do
       if ssh -o BatchMode=yes -o ConnectTimeout=5 root@$node "echo 'OK'" &>/dev/null; then
